@@ -200,9 +200,16 @@ pub fn run(scenario: &str, dir: &Path) -> AnyResult<Value> {
     let value = |k: &str| -> AnyResult<u64> {
         Ok(decimal(projection[k].as_str().ok_or("missing balance")?)?)
     };
-    Ok(
-        json!({"order_id":order,"backend":"sim","outcome":receipt.outcome,"asset":receipt.asset.id,"principal":receipt.principal,
-        "delta_buyer":(i128::from(value("buyer_balance")?)-i128::from(opening)).to_string(),"delta_seller":value("seller_balance")?.to_string(),
-        "delta_escrow":value("held")?.to_string(),"receipt":path}),
-    )
+    let delta_buyer = i128::from(value("buyer_balance")?) - i128::from(opening);
+    Ok(json!({
+        "order_id": order,
+        "backend": "sim",
+        "outcome": receipt.outcome,
+        "asset": receipt.asset.id,
+        "principal": receipt.principal,
+        "delta_buyer": delta_buyer.to_string(),
+        "delta_seller": value("seller_balance")?.to_string(),
+        "delta_escrow": value("held")?.to_string(),
+        "receipt": path,
+    }))
 }

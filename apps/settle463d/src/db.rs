@@ -78,10 +78,22 @@ pub(crate) async fn insert_message(db: &mut Conn, m: &SignedMessage, bytes: &[u8
     } else {
         None
     };
-    sqlx::query("INSERT INTO signed_messages(message_id,kind,environment,issuer,signed_bytes,canonical,signature,order_id,service_id) VALUES(?,?,?,?,?,?,?,?,?)")
-        .bind(hex_string(m.id())).bind(kind(m)).bind(&m.unsigned().environment).bind(&m.unsigned().issuer).bind(bytes)
-        .bind(canonical::canonical(&serde_json::to_value(m.unsigned())?)?).bind(hex_string(m.signature())).bind(order_of(m))
-        .bind(service).execute(db).await?;
+    sqlx::query(
+        "INSERT INTO signed_messages(message_id, kind, environment, issuer, signed_bytes,
+         canonical, signature, order_id, service_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(message_id) DO NOTHING",
+    )
+    .bind(hex_string(m.id()))
+    .bind(kind(m))
+    .bind(&m.unsigned().environment)
+    .bind(&m.unsigned().issuer)
+    .bind(bytes)
+    .bind(canonical::canonical(&serde_json::to_value(m.unsigned())?)?)
+    .bind(hex_string(m.signature()))
+    .bind(order_of(m))
+    .bind(service)
+    .execute(db)
+    .await?;
     Ok(())
 }
 pub(crate) fn issuer_sign(s: &State, body: Body) -> Result<SignedMessage> {
@@ -256,9 +268,28 @@ pub(crate) async fn publish(
                 return Err(ApiError::conflict("ACCEPTANCE_EXISTS"));
             }
             insert_message(db, msg, bytes).await?;
-            sqlx::query("INSERT INTO orders(order_id,request_id,quote_id,acceptance_id,buyer,seller,verifier,receipt_issuer,principal,buyer_destination,seller_destination,fund_by,deliver_by,resolve_by,state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Accepted')")
-             .bind(&a.order_id).bind(&a.request_id).bind(&a.quote_id).bind(&id).bind(&q.buyer).bind(&q.seller).bind(&q.verifier).bind(&q.receipt_issuer)
-             .bind(&q.amount).bind(&review.buyer_destination).bind(&review.seller_destination).bind(&q.deadlines.fund_by).bind(&q.deadlines.deliver_by).bind(&q.deadlines.resolve_by).execute(&mut *db).await?;
+            sqlx::query(
+                "INSERT INTO orders(order_id, request_id, quote_id, acceptance_id, buyer, seller,
+                 verifier, receipt_issuer, principal, buyer_destination, seller_destination, fund_by,
+                 deliver_by, resolve_by, state) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 'Accepted')",
+            )
+            .bind(&a.order_id)
+            .bind(&a.request_id)
+            .bind(&a.quote_id)
+            .bind(&id)
+            .bind(&q.buyer)
+            .bind(&q.seller)
+            .bind(&q.verifier)
+            .bind(&q.receipt_issuer)
+            .bind(&q.amount)
+            .bind(&review.buyer_destination)
+            .bind(&review.seller_destination)
+            .bind(&q.deadlines.fund_by)
+            .bind(&q.deadlines.deliver_by)
+            .bind(&q.deadlines.resolve_by)
+            .execute(&mut *db)
+            .await?;
             audit(
                 s,
                 db,
@@ -286,11 +317,12 @@ pub(crate) async fn publish(
             insert_message(db, msg, bytes).await?;
         }
         Body::Verdict(v) => {
-            let row =
-                sqlx::query("SELECT delivery_id,definitive_id,state FROM orders WHERE order_id=?")
-                    .bind(&v.order_id)
-                    .fetch_one(&mut *db)
-                    .await?;
+            let row = sqlx::query(
+                "SELECT delivery_id,definitive_id,state,version FROM orders WHERE order_id=?",
+            )
+            .bind(&v.order_id)
+            .fetch_one(&mut *db)
+            .await?;
             let committed: Option<String> = row.get("delivery_id");
             if committed.as_deref() != Some(&v.delivery_id) {
                 return Err(ApiError::link());
@@ -316,11 +348,59 @@ pub(crate) async fn publish(
             }
             insert_message(db, msg, bytes).await?;
             if v.decision != "INDETERMINATE" {
-                sqlx::query("UPDATE orders SET definitive_id=?,version=version+1 WHERE order_id=? AND definitive_id IS NULL")
-                  .bind(&id).bind(&v.order_id).execute(&mut *db).await?;
+                let changed = sqlx::query(
+                    "UPDATE orders SET definitive_id=?, version=version+1 WHERE order_id=?
+                     AND definitive_id IS NULL AND version=?",
+                )
+                .bind(&id)
+                .bind(&v.order_id)
+                .bind(row.get::<i64, _>("version"))
+                .execute(&mut *db)
+                .await?;
+                if changed.rows_affected() != 1 {
+                    return Err(ApiError::conflict("STATE_CONFLICT"));
+                }
             }
         }
-        Body::Receipt(_) | Body::Observation(_) => return Err(ApiError::denied("ROLE_FORBIDDEN")),
+        Body::Receipt(r) => {
+            let accepted = agreement(db, env, &r.order_id).await?;
+            let review = Review::sim_fund(&accepted, env)?;
+            if r.receipt_issuer != review.receipt_issuer
+                || r.request_id != review.request_id
+                || r.quote_id != review.quote_id
+                || r.acceptance_id != review.acceptance_id
+                || r.buyer != review.buyer
+                || r.seller != review.seller
+                || r.verifier != review.verifier
+                || r.asset != review.asset
+                || r.principal != review.principal
+            {
+                return Err(ApiError::link());
+            }
+            if let Some(id) = &r.delivery_id {
+                let delivery = load(db, id, env).await?;
+                settle463_core::settlement::check_delivery(&review, &delivery)?;
+                if let Some(id) = &r.verdict_id {
+                    let verdict = load(db, id, env).await?;
+                    settle463_core::settlement::check_verdict(&review, &delivery, &verdict)?;
+                    let (_, quote) = accepted.terms(env)?;
+                    settle463_core::settlement::check_pass_policy(&quote.artifact, &verdict)?;
+                    let decision = if r.outcome == "paid" { "PASS" } else { "FAIL" };
+                    if !matches!(&verdict.unsigned().payload, Body::Verdict(v) if v.decision == decision)
+                    {
+                        return Err(ApiError::link());
+                    }
+                }
+            }
+            // An exchanged envelope is evidence. Only local finalized settlement can produce an export.
+            insert_message(db, msg, bytes).await?;
+        }
+        Body::Observation(o) => {
+            if !member(db, &o.order_id, &msg.unsigned().issuer, "receipt_issuer").await? {
+                return Err(ApiError::denied("ROLE_FORBIDDEN"));
+            }
+            insert_message(db, msg, bytes).await?;
+        }
     }
     Ok(bytes.to_vec())
 }
@@ -339,11 +419,23 @@ pub(crate) async fn order_projection(s: &State, db: &mut Conn, order: &str) -> R
     } else {
         None
     };
-    json_bytes(
-        json!({"order_id":order,"state":row.get::<String,_>("state"),"held":row.get::<String,_>("held"),"paid":row.get::<String,_>("paid"),"refunded":row.get::<String,_>("refunded"),
-        "review":review,"request":value(db,&review.request_id).await?,"quote":value(db,&review.quote_id).await?,"acceptance":value(db,&review.acceptance_id).await?,
-        "definitive_verdict":verdict,"delivery_id":row.get::<Option<String>,_>("delivery_id"),"verdict_id":row.get::<Option<String>,_>("verdict_id"),
-        "terminal_clock":row.get::<Option<String>,_>("terminal_clock"),"terminal_locator":row.get::<Option<String>,_>("terminal_locator"),
-        "buyer_balance":sim.balance(&review.buyer_destination,&review.asset.id)?.to_string(),"seller_balance":sim.balance(&review.seller_destination,&review.asset.id)?.to_string(),"clock":clock(db).await?.to_string()}),
-    )
+    json_bytes(json!({
+        "order_id": order,
+        "state": row.get::<String,_>("state"),
+        "held": row.get::<String,_>("held"),
+        "paid": row.get::<String,_>("paid"),
+        "refunded": row.get::<String,_>("refunded"),
+        "review": review,
+        "request": value(db,&review.request_id).await?,
+        "quote": value(db,&review.quote_id).await?,
+        "acceptance": value(db,&review.acceptance_id).await?,
+        "definitive_verdict": verdict,
+        "delivery_id": row.get::<Option<String>,_>("delivery_id"),
+        "verdict_id": row.get::<Option<String>,_>("verdict_id"),
+        "terminal_clock": row.get::<Option<String>,_>("terminal_clock"),
+        "terminal_locator": row.get::<Option<String>,_>("terminal_locator"),
+        "buyer_balance": sim.balance(&review.buyer_destination,&review.asset.id)?.to_string(),
+        "seller_balance": sim.balance(&review.seller_destination,&review.asset.id)?.to_string(),
+        "clock": clock(db).await?.to_string(),
+    }))
 }

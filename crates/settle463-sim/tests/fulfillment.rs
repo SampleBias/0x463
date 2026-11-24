@@ -366,6 +366,32 @@ fn published_bundle_verifies_and_injected_fields_fail() {
         trusted_order: doc["order_id"].as_str().unwrap().into(),
     };
     assert_eq!(verify_sim_bundle(WORKED, &trust).unwrap().outcome, "paid");
+    let receipt = &doc["receipt"]["body"];
+    for (field, replacement) in [
+        ("asset_id", json!("different-asset")),
+        ("decimals", json!("5")),
+        ("clock", json!(RESOLVE.to_string())),
+        ("deployment_id", json!("different-deployment")),
+        ("principal", json!("1999999")),
+        (
+            "destination",
+            json!(format!("sim:{}", receipt["buyer"].as_str().unwrap())),
+        ),
+        (
+            "terminal_locator",
+            json!(format!("sim:{}:2", trust.trusted_order)),
+        ),
+        ("finality", json!("finalized")),
+        ("ledger_kind", json!("solana")),
+    ] {
+        let mut altered = doc.clone();
+        altered["ledger"][field] = replacement;
+        assert_eq!(
+            verify_sim_bundle(&serde_json::to_vec(&altered).unwrap(), &trust),
+            Err(ReceiptError::InvalidEvidence),
+            "contradictory simulator ledger field {field}"
+        );
+    }
     doc["observations"] = json!([doc["verdict"].clone()]);
     assert_eq!(
         verify_sim_bundle(&serde_json::to_vec(&doc).unwrap(), &trust),

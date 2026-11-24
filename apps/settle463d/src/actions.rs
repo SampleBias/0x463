@@ -53,7 +53,13 @@ async fn action_review(
     let review = sim.prepare_action(order, act, evidence.as_ref())?;
     Ok((review, evidence))
 }
-async fn execute(s: &State, db: &mut Conn, sim: &Simulator, order: &str, v: &Value) -> Result<String> {
+async fn execute(
+    s: &State,
+    db: &mut Conn,
+    sim: &Simulator,
+    order: &str,
+    v: &Value,
+) -> Result<String> {
     if field(v, "action")? == "fund" {
         let agreement = db::agreement(db, &s.config.environment, order).await?;
         let review = sim.prepare_fund(agreement)?;
@@ -68,7 +74,9 @@ async fn execute(s: &State, db: &mut Conn, sim: &Simulator, order: &str, v: &Val
             .get("signature")
             .map(|s| hex::<64>(s.as_str().unwrap_or("")))
             .transpose()?;
-        Ok(sim.submit_action(&review, evidence.as_ref(), sig.as_ref())?.intent_id)
+        Ok(sim
+            .submit_action(&review, evidence.as_ref(), sig.as_ref())?
+            .intent_id)
     }
 }
 
@@ -81,8 +89,12 @@ pub(crate) async fn restore(s: &State, db: &mut Conn) -> Result<Simulator> {
         c.clock,
         [(format!("sim:{}", c.buyer), c.opening_balance)],
     )?;
-    let history:Vec<(String,Vec<u8>,String)>=sqlx::query_as("SELECT order_id,signed_bytes,execution_clock FROM intents WHERE state='finalized_success' ORDER BY ledger_seq")
-        .fetch_all(&mut *db).await?;
+    let history: Vec<(String, Vec<u8>, String)> = sqlx::query_as(
+        "SELECT order_id, signed_bytes, execution_clock FROM intents WHERE
+         state='finalized_success' ORDER BY ledger_seq",
+    )
+    .fetch_all(&mut *db)
+    .await?;
     for (order, bytes, clock) in history {
         sim.set_clock(timestamp(&clock)?)?;
         execute(s, db, &sim, &order, &serde_json::from_slice(&bytes)?).await?;
@@ -139,14 +151,23 @@ pub(crate) async fn enqueue(s: &State, db: &mut Conn, order: &str, v: &Value) ->
     }
     let sim = restore(s, db).await?;
     let intent = execute(s, db, &sim, order, v).await?;
-    let now = db::clock(db).await?.to_string();
+    let now = http::now()?.to_string();
     let signature = v
         .get("signature")
         .or_else(|| v.get("buyer_signature"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    let inserted=sqlx::query("INSERT OR IGNORE INTO intents(intent_id,order_id,action,state,signed_bytes,local_signature) VALUES(?,?,?,'prepared',?,?)")
-      .bind(&intent).bind(order).bind(action).bind(input).bind(signature).execute(&mut *db).await?;
+    let inserted = sqlx::query(
+        "INSERT OR IGNORE INTO intents(intent_id, order_id, action, state, signed_bytes,
+         local_signature) VALUES(?, ?, ?, 'prepared', ?, ?)",
+    )
+    .bind(&intent)
+    .bind(order)
+    .bind(action)
+    .bind(input)
+    .bind(signature)
+    .execute(&mut *db)
+    .await?;
     if inserted.rows_affected() != 1 {
         return Err(ApiError::conflict("STATE_CONFLICT"));
     }
@@ -206,8 +227,13 @@ async fn receipt(s: &State, db: &mut Conn, view: &OrderView) -> Result<()> {
         vec![id.clone()],
     )
     .await?;
-    let rows:Vec<Vec<u8>>=sqlx::query_scalar("SELECT m.signed_bytes FROM audit_events e JOIN signed_messages m ON e.observation_id=m.message_id WHERE e.order_id=? ORDER BY e.seq")
-      .bind(order).fetch_all(&mut *db).await?;
+    let rows: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT m.signed_bytes FROM audit_events e JOIN signed_messages m ON
+         e.observation_id=m.message_id WHERE e.order_id=? ORDER BY e.seq",
+    )
+    .bind(order)
+    .fetch_all(&mut *db)
+    .await?;
     let observations = rows
         .iter()
         .map(|b| settle463_core::parse_signed(b, &s.config.environment))
@@ -267,14 +293,33 @@ pub(crate) async fn process(s: &State, id: &str) -> Result<()> {
                 return Err(ApiError::store());
             }
             let view = sim.inspect(&order)?.ok_or_else(ApiError::store)?;
-            let changed=sqlx::query("UPDATE orders SET state=?,held=?,paid=?,refunded=?,delivery_id=?,verdict_id=?,terminal_locator=?,terminal_clock=?,version=version+1 WHERE order_id=? AND version=?")
-                .bind(format!("{:?}",view.state)).bind(view.held.to_string()).bind(view.paid.to_string()).bind(view.refunded.to_string())
-                .bind(&view.delivery_id).bind(&view.verdict_id).bind(&view.terminal_locator).bind(view.terminal_clock.map(|n|n.to_string())).bind(&order).bind(version).execute(&mut *tx).await?;
+            let changed = sqlx::query(
+                "UPDATE orders SET state=?, held=?, paid=?, refunded=?, delivery_id=?, verdict_id=?,
+                 terminal_locator=?, terminal_clock=?, version=version+1 WHERE order_id=? AND version=?",
+            )
+            .bind(format!("{:?}",view.state))
+            .bind(view.held.to_string())
+            .bind(view.paid.to_string())
+            .bind(view.refunded.to_string())
+            .bind(&view.delivery_id)
+            .bind(&view.verdict_id)
+            .bind(&view.terminal_locator)
+            .bind(view.terminal_clock.map(|n|n.to_string()))
+            .bind(&order)
+            .bind(version)
+            .execute(&mut *tx)
+            .await?;
             if changed.rows_affected() != 1 {
                 return Err(ApiError::conflict("STATE_CONFLICT"));
             }
-            sqlx::query("UPDATE intents SET state='finalized_success',execution_clock=?,ledger_seq=(SELECT coalesce(max(ledger_seq),0)+1 FROM intents) WHERE intent_id=?")
-              .bind(sim.clock()?.to_string()).bind(id).execute(&mut *tx).await?;
+            sqlx::query(
+                "UPDATE intents SET state='finalized_success', execution_clock=?, ledger_seq=(SELECT
+                 coalesce(max(ledger_seq), 0)+1 FROM intents) WHERE intent_id=?",
+            )
+            .bind(sim.clock()?.to_string())
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
             db::audit(
                 s,
                 &mut tx,
@@ -311,11 +356,24 @@ pub(crate) async fn process(s: &State, id: &str) -> Result<()> {
 }
 
 pub(crate) async fn recover(s: &State) -> Result<()> {
-    let ids: Vec<String> = sqlx::query_scalar("SELECT intent_id FROM outbox ORDER BY id")
-        .fetch_all(&s.pool)
-        .await?;
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT intent_id FROM outbox WHERE CAST(available_at AS INTEGER)<=? ORDER BY id",
+    )
+    .bind(http::now()?)
+    .fetch_all(&s.pool)
+    .await?;
     for id in ids {
-        process(s, &id).await?;
+        if let Err(error) = process(s, &id).await {
+            eprintln!("intent {id} recovery: {error}");
+            sqlx::query(
+                "UPDATE outbox SET attempts=attempts+1,last_error=?,available_at=? WHERE intent_id=?",
+            )
+            .bind(error.1)
+            .bind((http::now()? + 1).to_string())
+            .bind(id)
+            .execute(&s.pool)
+            .await?;
+        }
     }
     Ok(())
 }

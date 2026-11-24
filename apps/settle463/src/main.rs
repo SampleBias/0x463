@@ -3,8 +3,11 @@ mod session;
 
 use serde_json::{json, Value};
 use settle463_core::{
+    canonical,
     ident::{environment, hex},
+    parse_signed,
     receipt::{verify_sim_bundle, ReceiptError, ReceiptTrust},
+    settlement::{Agreement, Review},
 };
 use settle463_sdk::{HttpCoordinator, Role};
 use std::{collections::BTreeMap, error::Error, fs, path::Path, process::ExitCode};
@@ -57,10 +60,13 @@ impl Options {
     }
     fn trust(&self) -> AnyResult<ReceiptTrust> {
         let mut value = if let Some(file) = self.get("--trust-file") {
-            serde_json::from_slice(&fs::read(file)?)?
+            canonical::parse(&fs::read(file)?)?
         } else {
             json!({})
         };
+        if !value.is_object() {
+            return Err("trust file must contain an object".into());
+        }
         for (option, key) in [
             ("--trusted-order", "trusted_order"),
             ("--trusted-issuer", "trusted_issuer"),
@@ -114,12 +120,24 @@ fn inspect(opts: &Options, order: &str) -> AnyResult<u8> {
     };
     let http = HttpCoordinator::new(endpoint, &trust.environment, key, Role::Buyer)?;
     let projection = http.order(order)?;
-    let review = &projection["review"];
-    if review["order_id"] != trust.trusted_order
-        || review["receipt_issuer"] != trust.trusted_issuer
-        || review["environment"] != trust.environment
-    {
+    let signed = |key: &str| -> AnyResult<_> {
+        Ok(parse_signed(
+            &serde_json::to_vec(&projection[key])?,
+            &trust.environment,
+        )?)
+    };
+    let agreement = Agreement {
+        request: signed("request")?,
+        quote: signed("quote")?,
+        acceptance: signed("acceptance")?,
+    };
+    let pinned = Review::sim_fund(&agreement, &trust.environment)?;
+    if pinned.order_id != trust.trusted_order || pinned.receipt_issuer != trust.trusted_issuer {
         return Ok(3);
+    }
+    let review = serde_json::to_value(pinned)?;
+    if review != projection["review"] {
+        return Err("coordinator review differs from signed agreement".into());
     }
     let mut result = json!({"order_id":order});
     let balances = [
@@ -153,28 +171,46 @@ fn run(args: &[String]) -> AnyResult<u8> {
     let opts = Options::parse(args)?;
     let cmd: Vec<_> = opts.args.iter().map(String::as_str).collect();
     match cmd.as_slice() {
-        ["demo"] if opts.get("--backend")==Some("sim") => {
-            let scenario=opts.get("--scenario").ok_or("missing --scenario")?;
-            let dir=session::create_dir(opts.get("--output-dir"))?;
-            let result=demo::run(scenario,&dir)?;
-            let keys=["order_id","backend","outcome","asset","principal","delta_buyer","delta_seller","delta_escrow","receipt"];
-            print_value(&result,&keys,opts.json)?;
-            Ok(0)
-        }
-        ["receipt","verify",bundle] if opts.offline => {
-            let trust=opts.trust()?;
-            let bytes=fs::read(bundle)?;
-            let (code,label)=match verify_sim_bundle(&bytes,&trust) {
-                Ok(_)=>(0,"evidence_signed"),
-                Err(ReceiptError::InvalidEvidence)=>(2,"invalid_evidence"),
-                Err(ReceiptError::Untrusted)=>(3,"untrusted"),
-            };
-            if opts.json {println!("{}",json!({"result":label}));} else {println!("{label}");}
-            Ok(code)
-        }
-        ["order","inspect",order] => inspect(&opts,order),
+        ["demo"] if opts.get("--backend") == Some("sim") => run_demo(&opts),
+        ["receipt", "verify", bundle] if opts.offline => verify(&opts, bundle),
+        ["order", "inspect", order] => inspect(&opts, order),
         _ => Err("usage: settle463 demo --backend sim --scenario <scenario> | receipt verify <bundle> --offline --trust-file <file> | order inspect <id> --trust-file <file>".into()),
     }
+}
+
+fn run_demo(opts: &Options) -> AnyResult<u8> {
+    let scenario = opts.get("--scenario").ok_or("missing --scenario")?;
+    let dir = session::create_dir(opts.get("--output-dir"))?;
+    let result = demo::run(scenario, &dir)?;
+    let keys = [
+        "order_id",
+        "backend",
+        "outcome",
+        "asset",
+        "principal",
+        "delta_buyer",
+        "delta_seller",
+        "delta_escrow",
+        "receipt",
+    ];
+    print_value(&result, &keys, opts.json)?;
+    Ok(0)
+}
+
+fn verify(opts: &Options, bundle: &str) -> AnyResult<u8> {
+    let trust = opts.trust()?;
+    let bytes = fs::read(bundle)?;
+    let (code, label) = match verify_sim_bundle(&bytes, &trust) {
+        Ok(_) => (0, "evidence_signed"),
+        Err(ReceiptError::InvalidEvidence) => (2, "invalid_evidence"),
+        Err(ReceiptError::Untrusted) => (3, "untrusted"),
+    };
+    if opts.json {
+        println!("{}", json!({"result": label}));
+    } else {
+        println!("{label}");
+    }
+    Ok(code)
 }
 fn main() -> ExitCode {
     match run(&std::env::args().skip(1).collect::<Vec<_>>()) {

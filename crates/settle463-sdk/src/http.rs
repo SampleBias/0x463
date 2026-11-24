@@ -2,7 +2,7 @@
 
 use crate::{Error, Identity, MessageTransport, Result};
 use ed25519_dalek::Signer;
-use serde_json::{json, Value};
+use serde_json::{json, value::RawValue, Value};
 use settle463_core::{
     canonical::canonical,
     ident::{decimal, environment, hex, hex_string, timestamp},
@@ -15,7 +15,7 @@ use settle463_core::{
     SignedMessage,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io::Read,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -46,7 +46,6 @@ pub struct HttpCoordinator {
     pub(crate) identity: Identity,
     pub(crate) role: Role,
     agent: ureq::Agent,
-    private_ids: Mutex<HashMap<String, String>>,
     intents: Mutex<HashMap<String, String>>,
 }
 pub(crate) fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
@@ -72,6 +71,13 @@ fn read_response(
         }
         Err(ureq::Error::Transport(_)) => return Err(Error::Unavailable),
     };
+    if resp
+        .header("Content-Length")
+        .and_then(|h| h.parse::<u64>().ok())
+        .is_some_and(|n| n > limit as u64)
+    {
+        return Err(Error::Linkage);
+    }
     let mut bytes = Vec::new();
     resp.into_reader()
         .take((limit + 1) as u64)
@@ -83,6 +89,36 @@ fn read_response(
     Ok(bytes)
 }
 const MAX_JSON: usize = 16 * 1024 * 1024;
+type RawObject<'a> = BTreeMap<String, &'a RawValue>;
+
+// An HTTP page or projection can contain null. Its embedded protocol envelopes must
+// retain their original bytes until strict signature and duplicate-name checks finish.
+fn offer_page(bytes: &[u8], env: &str) -> Result<(Vec<SignedMessage>, Option<String>)> {
+    let page: RawObject<'_> = serde_json::from_slice(bytes)?;
+    let raw_items: Vec<&RawValue> =
+        serde_json::from_str(page.get("items").ok_or(Error::Linkage)?.get())?;
+    let mut items = Vec::with_capacity(raw_items.len());
+    for item in raw_items {
+        let message = parse_signed(item.get().as_bytes(), env)?;
+        if !matches!(message.unsigned().payload, Body::ServiceOffer(_)) {
+            return Err(Error::Linkage);
+        }
+        items.push(message);
+    }
+    let cursor = serde_json::from_str(page.get("next_cursor").ok_or(Error::Linkage)?.get())?;
+    Ok((items, cursor))
+}
+
+fn order_response(bytes: &[u8], env: &str) -> Result<Value> {
+    let projection: RawObject<'_> = serde_json::from_slice(bytes)?;
+    for name in ["request", "quote", "acceptance", "definitive_verdict"] {
+        if let Some(raw) = projection.get(name).filter(|v| v.get() != "null") {
+            parse_signed(raw.get().as_bytes(), env)?;
+        }
+    }
+    Ok(serde_json::from_slice(bytes)?)
+}
+
 fn join_order(order: &str, suffix: &str) -> Result<String> {
     hex::<32>(order)?;
     Ok(format!("/v1/orders/{order}{suffix}"))
@@ -111,7 +147,6 @@ impl HttpCoordinator {
             identity,
             role,
             agent,
-            private_ids: Mutex::default(),
             intents: Mutex::default(),
         })
     }
@@ -146,7 +181,11 @@ impl HttpCoordinator {
             hex_string(&message_id(query.as_bytes()))
         };
         let mut image = b"0x463/http/0.1\0".to_vec();
-        image.extend(canonical(&json!({"challenge_id":id,"expires_at":expiry,"method":method,"nonce":nonce,"path":path,"public_key":key,"query_hash":query_hash,"role":role}))?);
+        image.extend(canonical(&json!({
+            "challenge_id": id, "expires_at": expiry, "method": method,
+            "nonce": nonce, "path": path, "public_key": key,
+            "query_hash": query_hash, "role": role,
+        }))?);
         let sig = self.identity.0.sign(&image).to_bytes();
         Ok(format!("0x463 {id}.{}", hex_string(&sig)))
     }
@@ -164,11 +203,7 @@ impl HttpCoordinator {
         let path = join_order(order, &format!("/actions/{kind}"))?;
         let auth = self.authorization("POST", &path)?;
         let bytes = serde_json::to_vec(&body)?;
-        let key = if kind == "submit" {
-            hex_string(&message_id(&[path.as_bytes(), b"\0", &bytes].concat()))
-        } else {
-            hex_string(&crate::random_seed()?)
-        };
+        let key = hex_string(&crate::random_seed()?);
         let req = self
             .agent
             .post(&format!("{}{path}", self.base))
@@ -181,9 +216,8 @@ impl HttpCoordinator {
         )?)?)
     }
     pub fn order(&self, order: &str) -> Result<Value> {
-        Ok(serde_json::from_slice(
-            &self.private_get(&join_order(order, "")?, MAX_JSON)?,
-        )?)
+        let bytes = self.private_get(&join_order(order, "")?, MAX_JSON)?;
+        order_response(&bytes, &self.env)
     }
     pub fn receipt(&self, order: &str) -> Result<Vec<u8>> {
         self.private_get(&join_order(order, "/receipt")?, MAX_JSON)
@@ -203,10 +237,7 @@ impl HttpCoordinator {
             .set("Content-Type", "application/octet-stream")
             .set("X-Artifact-Length", &bytes.len().to_string())
             .set("X-Artifact-Digest", &hex_string(&message_id(bytes)))
-            .set(
-                "Idempotency-Key",
-                &hex_string(&message_id(&[path.as_bytes(), b"\0", bytes].concat())),
-            )
+            .set("Idempotency-Key", &hex_string(&crate::random_seed()?))
             .set("Authorization", &self.authorization("POST", &path)?);
         Ok(serde_json::from_slice(&read_response(
             req.send_bytes(bytes),
@@ -233,7 +264,17 @@ impl HttpCoordinator {
             &self.private_get(&format!("/v1/messages/{id}?order_id={order}"), MAX_JSON)?,
             &self.env,
         )?;
-        if hex_string(msg.id()) != id {
+        let signed_order = match &msg.unsigned().payload {
+            Body::Request(v) => &v.order_id,
+            Body::Quote(v) => &v.order_id,
+            Body::Accept(v) => &v.order_id,
+            Body::Delivery(v) => &v.order_id,
+            Body::Verdict(v) => &v.order_id,
+            Body::Receipt(v) => &v.order_id,
+            Body::Observation(v) => &v.order_id,
+            Body::ServiceOffer(_) => return Err(Error::Linkage),
+        };
+        if signed_order != order || hex_string(msg.id()) != id {
             return Err(Error::Linkage);
         }
         Ok(msg)
@@ -242,14 +283,14 @@ impl HttpCoordinator {
         if msg.unsigned().environment != self.env {
             return Err(Error::Environment);
         }
-        let (route, order) = match &msg.unsigned().payload {
-            Body::ServiceOffer(_) => ("offers", None),
-            Body::Request(r) => ("requests", Some(&r.order_id)),
-            Body::Quote(q) => ("quotes", Some(&q.order_id)),
-            Body::Accept(a) => ("acceptances", Some(&a.order_id)),
-            Body::Delivery(d) => ("deliveries", Some(&d.order_id)),
-            Body::Verdict(v) => ("verdicts", Some(&v.order_id)),
-            _ if direct => ("messages", None),
+        let route = match &msg.unsigned().payload {
+            Body::ServiceOffer(_) => "offers",
+            Body::Request(_) => "requests",
+            Body::Quote(_) => "quotes",
+            Body::Accept(_) => "acceptances",
+            Body::Delivery(_) => "deliveries",
+            Body::Verdict(_) => "verdicts",
+            _ if direct => "messages",
             _ => return Err(Error::Linkage),
         };
         let route = if direct { "messages" } else { route };
@@ -257,11 +298,14 @@ impl HttpCoordinator {
             .agent
             .post(&format!("{}/v1/{route}", self.base))
             .set("Content-Type", "application/json")
-            .set("Idempotency-Key", &hex_string(msg.id()));
-        let returned = parse_signed(
-            &read_response(req.send_bytes(&msg.to_wire()?), MAX_JSON)?,
-            &self.env,
-        )?;
+            .set("Idempotency-Key", &hex_string(&crate::random_seed()?));
+        let bytes = match read_response(req.send_bytes(&msg.to_wire()?), MAX_JSON) {
+            Err(Error::Http { status: 409, code }) if code == "ACCEPTANCE_EXISTS" => {
+                return Err(Error::AcceptanceExists)
+            }
+            other => other?,
+        };
+        let returned = parse_signed(&bytes, &self.env)?;
         if returned.id() != msg.id() {
             match (&msg.unsigned().payload, &returned.unsigned().payload) {
                 (Body::Verdict(v), Body::Verdict(w))
@@ -274,26 +318,31 @@ impl HttpCoordinator {
                 _ => return Err(Error::Linkage),
             }
         }
-        if let Some(order) = order {
-            self.private_ids
-                .lock()
-                .map_err(|_| Error::Unavailable)?
-                .insert(hex_string(returned.id()), order.clone());
-        }
         Ok(returned)
     }
-    fn submission(&self, order: &str, v: &Value) -> Result<Submission> {
-        let id = text(v, "intent_id")?.to_owned();
-        hex::<32>(&id)?;
-        let outcome = outcome(v)?;
+    fn submit_command(&self, order: &str, intent_id: String, command: Value) -> Result<Submission> {
+        // Retain the locally computed ID even if the server commits and the response is lost.
         self.intents
             .lock()
             .map_err(|_| Error::Unavailable)?
-            .insert(id.clone(), order.to_owned());
+            .insert(intent_id.clone(), order.to_owned());
+        let response = self.json_action(order, "submit", command)?;
+        if text(&response, "intent_id")? != intent_id {
+            return Err(Error::Linkage);
+        }
         Ok(Submission {
-            intent_id: id,
-            outcome,
+            intent_id,
+            outcome: outcome(&response)?,
         })
+    }
+    pub fn reconcile_for_order(&self, order: &str, intent_id: &str) -> Result<ChainOutcome> {
+        hex::<32>(intent_id)?;
+        let path = join_order(order, &format!("/intents/{intent_id}"))?;
+        let response = serde_json::from_slice(&self.private_get(&path, 8192)?)?;
+        if text(&response, "intent_id")? != intent_id {
+            return Err(Error::Linkage);
+        }
+        outcome(&response)
     }
 }
 fn outcome(v: &Value) -> Result<ChainOutcome> {
@@ -312,44 +361,44 @@ impl MessageTransport for HttpCoordinator {
     }
     fn fetch(&self, id: &str) -> Result<SignedMessage> {
         hex::<32>(id)?;
-        let order = self
-            .private_ids
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .get(id)
-            .cloned();
-        if let Some(order) = order {
-            return self.fetch_for_order(id, &order);
-        }
-        let v = self.public_json("GET", &format!("/v1/offers/{id}"), None)?;
-        let msg = parse_signed(&serde_json::to_vec(&v)?, &self.env)?;
-        if !matches!(msg.unsigned().payload, Body::ServiceOffer(_)) || hex_string(msg.id()) != id {
+        let public = self
+            .agent
+            .get(&format!("{}/v1/offers/{id}", self.base))
+            .call();
+        let (raw, is_offer) = match read_response(public, MAX_JSON) {
+            Ok(raw) => (raw, true),
+            Err(Error::Http { status: 404, .. }) => (
+                self.private_get(&format!("/v1/messages/{id}"), MAX_JSON)?,
+                false,
+            ),
+            Err(e) => return Err(e),
+        };
+        let msg = parse_signed(&raw, &self.env)?;
+        if (is_offer && !matches!(msg.unsigned().payload, Body::ServiceOffer(_)))
+            || hex_string(msg.id()) != id
+        {
             return Err(Error::Linkage);
         }
         Ok(msg)
     }
     fn offers(&self) -> Result<Vec<SignedMessage>> {
         let mut items = Vec::new();
-        let mut cursor = String::new();
+        let mut cursor: Option<String> = None;
         let mut seen = HashSet::new();
         loop {
-            let page = self.public_json(
-                "GET",
-                &format!("/v1/offers?environment={}&limit=100{cursor}", self.env),
-                None,
-            )?;
-            for item in page["items"].as_array().ok_or(Error::Linkage)? {
-                let msg = parse_signed(&serde_json::to_vec(item)?, &self.env)?;
-                if !matches!(msg.unsigned().payload, Body::ServiceOffer(_)) {
-                    return Err(Error::Linkage);
-                }
-                items.push(msg);
+            let mut request = self
+                .agent
+                .get(&format!("{}/v1/offers", self.base))
+                .query("environment", &self.env)
+                .query("limit", "100");
+            if let Some(c) = &cursor {
+                request = request.query("cursor", c);
             }
-            match &page["next_cursor"] {
-                Value::Null => break,
-                Value::String(s) if decimal(s).is_ok() && seen.insert(s.clone()) => {
-                    cursor = format!("&cursor={s}")
-                }
+            let (page, next) = offer_page(&read_response(request.call(), MAX_JSON)?, &self.env)?;
+            items.extend(page);
+            match next {
+                None => break,
+                Some(next) if seen.insert(next.clone()) => cursor = Some(next),
                 _ => return Err(Error::Linkage),
             }
         }
@@ -367,8 +416,10 @@ impl MessageTransport for HttpCoordinator {
             return Ok(None);
         }
         let a = parse_signed(&serde_json::to_vec(&v["acceptance"])?, &self.env)?;
-        if !matches!(&a.unsigned().payload,Body::Accept(a) if a.request_id==hex_string(request.id()) && a.order_id==r.order_id)
-        {
+        let Body::Accept(accepted) = &a.unsigned().payload else {
+            return Err(Error::Linkage);
+        };
+        if accepted.request_id != hex_string(request.id()) || accepted.order_id != r.order_id {
             return Err(Error::Linkage);
         }
         Ok(Some(a))
@@ -396,7 +447,16 @@ fn funding(e: Error) -> FundingError {
         Error::Funding(e) => e,
         Error::Environment => FundingError::Environment,
         Error::Linkage => FundingError::Linkage,
-        Error::Http { code, .. } if code == "ALREADY_COMPLETE" => FundingError::AlreadyFunded,
+        Error::Wire(e) => FundingError::Wire(e),
+        Error::Http { code, .. } => match code.as_str() {
+            "ALREADY_COMPLETE" => FundingError::AlreadyFunded,
+            "STATE_CONFLICT" => FundingError::WrongState,
+            "ENVIRONMENT_MISMATCH" => FundingError::Environment,
+            "NOT_FOUND" => FundingError::OrderMissing,
+            "BAD_SIGNATURE" => FundingError::Wire(settle463_core::Error::Signature),
+            "LEDGER_UNAVAILABLE" | "STORE_UNAVAILABLE" => FundingError::Unavailable,
+            _ => FundingError::Linkage,
+        },
         _ => FundingError::Unavailable,
     }
 }
@@ -447,10 +507,15 @@ impl SettlementBackend for HttpCoordinator {
         s: &FundSignatures,
     ) -> settle463_core::settlement::Result<Submission> {
         f.check(&self.env)?;
-        s.verify(&f.review)?;
+        let expected_intent = s.verify(&f.review)?;
         let order = &f.review.order_id;
-        let v=self.json_action(order,"submit",json!({"action":"fund","buyer_signature":hex_string(&s.buyer),"seller_signature":hex_string(&s.seller)})).map_err(funding)?;
-        self.submission(order, &v).map_err(funding)
+        let command = json!({
+            "action": "fund",
+            "buyer_signature": hex_string(&s.buyer),
+            "seller_signature": hex_string(&s.seller),
+        });
+        self.submit_command(order, expected_intent, command)
+            .map_err(funding)
     }
     fn inspect(&self, order: &str) -> settle463_core::settlement::Result<Option<OrderView>> {
         let v = match self.order(order) {
@@ -486,10 +551,7 @@ impl SettlementBackend for HttpCoordinator {
         else {
             return Ok(ChainOutcome::Unknown);
         };
-        let path = format!("/v1/orders/{order}/intents/{id}");
-        let raw = self.private_get(&path, 8192).map_err(funding)?;
-        let v = serde_json::from_slice(&raw).map_err(settle463_core::Error::from)?;
-        outcome(&v).map_err(funding)
+        self.reconcile_for_order(&order, id).map_err(funding)
     }
     fn prepare_action(
         &self,
@@ -517,9 +579,29 @@ impl SettlementBackend for HttpCoordinator {
         if let Some(sig) = sig {
             b["signature"] = hex_string(sig).into();
         }
-        let v = self
-            .json_action(&r.terms.order_id, "submit", b)
-            .map_err(funding)?;
-        self.submission(&r.terms.order_id, &v).map_err(funding)
+        self.submit_command(&r.terms.order_id, r.intent_id()?, b)
+            .map_err(funding)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_envelopes_reject_duplicate_keys_before_map_deserialization() {
+        let duplicate =
+            |bytes: &str| bytes.replacen(r#""protocol":"#, r#""protocol":"other","protocol":"#, 1);
+        let offer = include_str!("../../../spec/examples/worked-transaction/service_offer.json");
+        let page = format!(r#"{{"items":[{offer}],"next_cursor":null}}"#);
+        let (items, cursor) = offer_page(page.as_bytes(), "sim:fixture").unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(cursor.is_none());
+        assert!(offer_page(duplicate(&page).as_bytes(), "sim:fixture").is_err());
+
+        let quote = include_str!("../../../spec/examples/worked-transaction/quote.json");
+        let order = format!(r#"{{"quote":{quote},"verdict_id":null}}"#);
+        assert!(order_response(order.as_bytes(), "sim:fixture").is_ok());
+        assert!(order_response(duplicate(&order).as_bytes(), "sim:fixture").is_err());
     }
 }

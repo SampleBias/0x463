@@ -29,7 +29,7 @@ fn header_value<'a>(headers: &'a HeaderMap, key: &str) -> Result<&'a str> {
         .and_then(|h| h.to_str().ok())
         .ok_or(ApiError::bad("BAD_ENCODING"))
 }
-fn now() -> Result<i64> {
+pub(crate) fn now() -> Result<i64> {
     i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -86,15 +86,34 @@ async fn authenticate(
         .and_then(|h| h.split_once('.'))
         .ok_or_else(ApiError::auth)?;
     let mut tx = s.pool.begin_with("BEGIN IMMEDIATE").await?;
-    let row=sqlx::query("SELECT nonce,public_key,role,expires_at FROM challenges WHERE challenge_id=? AND used=0 AND expires_at>?")
-        .bind(id).bind(now()?).fetch_optional(&mut *tx).await?.ok_or_else(ApiError::auth)?;
+    let row = sqlx::query(
+        "SELECT nonce, public_key, role, expires_at FROM challenges WHERE challenge_id=? AND
+         used=0 AND expires_at>?",
+    )
+    .bind(id)
+    .bind(now()?)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(ApiError::auth)?;
     let key: String = row.get("public_key");
     let role: String = row.get("role");
+    let query_hash = uri
+        .query()
+        .filter(|q| !q.is_empty())
+        .map(|q| digest(q.as_bytes()))
+        .unwrap_or_else(|| "00".repeat(32));
     let bytes = preimage(
         b"0x463/http/0.1",
-        &json!({"challenge_id":id,"expires_at":row.get::<i64,_>("expires_at").to_string(),
-        "method":method.as_str(),"nonce":row.get::<String,_>("nonce"),"path":uri.path(),"public_key":key,
-        "query_hash":uri.query().filter(|q|!q.is_empty()).map(|q|digest(q.as_bytes())).unwrap_or_else(||"00".repeat(32)),"role":role}),
+        &json!({
+            "challenge_id": id,
+            "expires_at": row.get::<i64,_>("expires_at").to_string(),
+            "method": method.as_str(),
+            "nonce": row.get::<String,_>("nonce"),
+            "path": uri.path(),
+            "public_key": key,
+            "query_hash": query_hash,
+            "role": role,
+        }),
     )?;
     let public = VerifyingKey::from_bytes(&hex(&key)?).map_err(|_| ApiError::auth())?;
     public
@@ -177,8 +196,7 @@ pub(crate) async fn dispatch(
     if key.is_empty() || key.len() > 256 {
         return Err(ApiError::bad("BAD_ENCODING"));
     }
-    let result = post(&s, &uri, &path, &headers, key, &bytes).await?;
-    Ok(response(result, "application/json"))
+    post(&s, &uri, &path, &headers, key, &bytes).await
 }
 
 fn query(uri: &Uri) -> Result<HashMap<String, String>> {
@@ -214,78 +232,149 @@ fn paged(mut rows: Vec<(i64, Vec<u8>)>, n: i64) -> Result<Vec<u8>> {
         .collect::<std::result::Result<Vec<_>, _>>()?;
     json_bytes(json!({"items":list,"next_cursor":cursor}))
 }
+async fn private_message(s: &State, uri: &Uri, headers: &HeaderMap, id: &str) -> Result<Vec<u8>> {
+    let caller = authenticate(s, &Method::GET, uri, headers).await?;
+    let query = query(uri)?;
+    let mut conn = s.pool.acquire().await?;
+    let (order, bytes): (String,Vec<u8>) = sqlx::query_as(
+        "SELECT order_id,signed_bytes FROM signed_messages WHERE message_id=? AND order_id IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_one(&mut *conn)
+    .await?;
+    if query.get("order_id").is_some_and(|given| given != &order) {
+        return Err(ApiError::missing());
+    }
+    let message = parse_signed(&bytes, &s.config.environment)?;
+    // Requests and quotes can be exchanged before acceptance creates order membership.
+    let recipient = match (&message.unsigned().payload, caller.role.as_str()) {
+        (Body::Request(r), "buyer") => Some(&r.buyer),
+        (Body::Request(r), "seller") => Some(&r.seller),
+        (Body::Quote(q), "buyer") => Some(&q.buyer),
+        (Body::Quote(q), "seller") => Some(&q.seller),
+        (Body::Quote(q), "verifier") => Some(&q.verifier),
+        (Body::Quote(q), "receipt_issuer") => Some(&q.receipt_issuer),
+        _ => None,
+    };
+    if recipient != Some(&caller.key)
+        && !db::member(&mut conn, &order, &caller.key, &caller.role).await?
+    {
+        return Err(ApiError::denied("ROLE_FORBIDDEN"));
+    }
+    Ok(bytes)
+}
+
+async fn events(conn: &mut Conn, uri: &Uri, order: &str) -> Result<Vec<u8>> {
+    let (cursor, count) = page(&query(uri)?)?;
+    let rows = sqlx::query(
+        "SELECT e.seq,e.event_type,e.payload_hash,e.prev_digest,e.event_digest,m.signed_bytes
+         FROM audit_events e JOIN signed_messages m ON m.message_id=e.observation_id
+         WHERE e.order_id=? AND e.seq>? ORDER BY e.seq LIMIT ?",
+    )
+    .bind(order)
+    .bind(cursor)
+    .bind(count + 1)
+    .fetch_all(conn)
+    .await?;
+    let mut result = Vec::new();
+    for row in rows {
+        let seq: i64 = row.get("seq");
+        let observation: Value = serde_json::from_slice(row.get("signed_bytes"))?;
+        let item = json!({
+            "order_id": order, "seq": seq.to_string(),
+            "event_type": row.get::<String,_>("event_type"),
+            "prev_digest": row.get::<String,_>("prev_digest"),
+            "payload_hash": row.get::<String,_>("payload_hash"),
+            "event_digest": row.get::<String,_>("event_digest"),
+            "observation": observation,
+        });
+        result.push((seq, json_bytes(item)?));
+    }
+    paged(result, count)
+}
+
+async fn artifact(s: &State, conn: &mut Conn, order: &str, id: &str) -> Result<Vec<u8>> {
+    hex::<32>(id)?;
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT storage_key,digest FROM artifacts WHERE order_id=? AND content_id=?",
+    )
+    .bind(order)
+    .bind(id)
+    .fetch_optional(conn)
+    .await?;
+    let (key, expected) = row.ok_or(ApiError::denied("ARTIFACT_FORBIDDEN"))?;
+    hex::<32>(&key)?;
+    let file = s.config.artifact_root.join(&key[..2]).join(&key);
+    let data = tokio::fs::read(file).await.map_err(|_| ApiError::store())?;
+    if digest(&data) != expected {
+        return Err(ApiError::store());
+    }
+    Ok(data)
+}
+
 async fn get(
     s: &State,
     uri: &Uri,
-    h: &HeaderMap,
+    headers: &HeaderMap,
     path: &[&str],
 ) -> Result<(Vec<u8>, &'static str)> {
-    let json = "application/json";
-    match path{
-        ["v1","health"]=>Ok((json_bytes(json!({"status":"ok","version":"0.1"}))?,json)),
-        ["v1","sim","clock"]=>{
-            let clock=db::clock(&mut *s.pool.acquire().await?).await?;
-            Ok((json_bytes(json!({"clock":clock.to_string(),"environment":s.config.environment}))?,json))
+    let body = match path {
+        ["v1", "health"] => json_bytes(json!({"status":"ok","version":"0.1"}))?,
+        ["v1", "sim", "clock"] => {
+            let clock = db::clock(&mut *s.pool.acquire().await?).await?;
+            json_bytes(json!({"clock":clock.to_string(),"environment":s.config.environment}))?
         }
-        ["v1","offers"]=>{
-            let q=query(uri)?;let env=q.get("environment").map(String::as_str).unwrap_or(&s.config.environment);
-            let service=q.get("service_id");
-            let (cur,n)=page(&q)?;
-            let rows=sqlx::query_as("SELECT rowid,signed_bytes FROM signed_messages WHERE kind='service_offer' AND environment=? AND (? IS NULL OR service_id=?) AND rowid>? ORDER BY rowid LIMIT ?")
-                .bind(env).bind(service).bind(service).bind(cur).bind(n+1).fetch_all(&s.pool).await?;
-            Ok((paged(rows,n)?,json))
+        ["v1", "offers"] => {
+            let params = query(uri)?;
+            let env = params.get("environment").unwrap_or(&s.config.environment);
+            let service = params.get("service_id");
+            let (cursor, count) = page(&params)?;
+            let rows = sqlx::query_as(
+                "SELECT rowid,signed_bytes FROM signed_messages WHERE kind='service_offer'
+                 AND environment=? AND (? IS NULL OR service_id=?) AND rowid>? ORDER BY rowid LIMIT ?",
+            )
+            .bind(env)
+            .bind(service)
+            .bind(service)
+            .bind(cursor)
+            .bind(count+1)
+            .fetch_all(&s.pool)
+            .await?;
+            paged(rows, count)?
         }
-        ["v1","offers",id]=>Ok((sqlx::query_scalar("SELECT signed_bytes FROM signed_messages WHERE kind='service_offer' AND message_id=?").bind(id).fetch_one(&s.pool).await?,json)),
-        ["v1","messages",id]=>{
-            let caller=authenticate(s,&Method::GET,uri,h).await?;
-            let q=query(uri)?;let order=q.get("order_id").ok_or_else(ApiError::auth)?;
-            let mut conn=s.pool.acquire().await?;
-            let bytes:Vec<u8>=sqlx::query_scalar("SELECT signed_bytes FROM signed_messages WHERE message_id=? AND order_id=?").bind(id).bind(order).fetch_one(&mut *conn).await?;
-            let message=parse_signed(&bytes,&s.config.environment)?;
-            let allowed=match &message.unsigned().payload{
-                Body::Request(r)=>match caller.role.as_str(){"buyer"=>caller.key==r.buyer,"seller"=>caller.key==r.seller,_=>false},
-                Body::Quote(q)=>match caller.role.as_str(){"buyer"=>caller.key==q.buyer,"seller"=>caller.key==q.seller,"verifier"=>caller.key==q.verifier,"receipt_issuer"=>caller.key==q.receipt_issuer,_=>false},
-                _=>false
-            };
-            if !allowed && !db::member(&mut conn,order,&caller.key,&caller.role).await?{return Err(ApiError::denied("ROLE_FORBIDDEN"));}
-            Ok((bytes,json))
-        }
-        ["v1","orders",order,rest @ ..]=>{
-            let c=authenticate(s,&Method::GET,uri,h).await?;
-            let artifact=rest.first()==Some(&"artifacts");require_member(s,order,&c,artifact).await?;
-            let mut conn=s.pool.acquire().await?;
-            let bytes=match *rest {
-                []=>db::order_projection(s,&mut conn,order).await?,
-                ["receipt"]=>sqlx::query_scalar("SELECT bundle FROM receipts WHERE order_id=?").bind(order).fetch_optional(&mut *conn).await?
-                    .ok_or(ApiError(StatusCode::NOT_FOUND,"RECEIPT_NOT_READY"))?,
-                ["intents",id]=>actions::status(&mut conn,order,id).await?,
-                ["events"]=>{
-                    let q=query(uri)?;let (cur,n)=page(&q)?;
-                    let rows=sqlx::query("SELECT e.seq,e.event_type,e.payload_hash,e.prev_digest,e.event_digest,m.signed_bytes FROM audit_events e JOIN signed_messages m ON m.message_id=e.observation_id WHERE e.order_id=? AND e.seq>? ORDER BY e.seq LIMIT ?")
-                    .bind(order).bind(cur).bind(n+1).fetch_all(&mut *conn).await?;
-                    let mut result=Vec::new();
-                    for row in rows{
-                        let seq:i64=row.get("seq");let obs:Value=serde_json::from_slice(row.get("signed_bytes"))?;
-                        result.push((seq,json_bytes(json!({"order_id":order,"seq":seq.to_string(),"event_type":row.get::<String,_>("event_type"),"prev_digest":row.get::<String,_>("prev_digest"),
-                            "payload_hash":row.get::<String,_>("payload_hash"),"event_digest":row.get::<String,_>("event_digest"),"observation":obs}))?));
-                    }
-                    paged(result,n)?
+        ["v1", "offers", id] => sqlx::query_scalar(
+            "SELECT signed_bytes FROM signed_messages WHERE kind='service_offer' AND message_id=?",
+        )
+        .bind(id)
+        .fetch_one(&s.pool)
+        .await?,
+        ["v1", "messages", id] => private_message(s, uri, headers, id).await?,
+        ["v1", "orders", order, rest @ ..] => {
+            let caller = authenticate(s, &Method::GET, uri, headers).await?;
+            require_member(s, order, &caller, rest.first() == Some(&"artifacts")).await?;
+            // Read the projection and its ledger balances from the same SQLite snapshot.
+            let mut conn = s.pool.begin().await?;
+            match *rest {
+                [] => db::order_projection(s, &mut conn, order).await?,
+                ["receipt"] => sqlx::query_scalar("SELECT bundle FROM receipts WHERE order_id=?")
+                    .bind(order)
+                    .fetch_optional(&mut *conn)
+                    .await?
+                    .ok_or(ApiError(StatusCode::NOT_FOUND, "RECEIPT_NOT_READY"))?,
+                ["intents", id] => actions::status(&mut conn, order, id).await?,
+                ["events"] => events(&mut conn, uri, order).await?,
+                ["artifacts", id] => {
+                    return Ok((
+                        artifact(s, &mut conn, order, id).await?,
+                        "application/octet-stream",
+                    ))
                 }
-                ["artifacts",id]=>{
-                    hex::<32>(id)?;
-                    let row:Option<(String,String)>=sqlx::query_as("SELECT storage_key,digest FROM artifacts WHERE order_id=? AND content_id=?").bind(order).bind(id).fetch_optional(&mut *conn).await?;
-                    let (key,expected)=row.ok_or(ApiError::denied("ARTIFACT_FORBIDDEN"))?;
-                    hex::<32>(&key)?;let file=s.config.artifact_root.join(&key[..2]).join(&key);
-                    let data=tokio::fs::read(file).await.map_err(|_|ApiError::store())?;
-                    if digest(&data)!=expected{return Err(ApiError::store());}
-                    return Ok((data,"application/octet-stream"))
-                }
-                _=>return Err(ApiError::missing())
-            };
-            Ok((bytes,json))
+                _ => return Err(ApiError::missing()),
+            }
         }
-        _=>Err(ApiError::missing())
-    }
+        _ => return Err(ApiError::missing()),
+    };
+    Ok((body, "application/json"))
 }
 
 struct Idem<'a> {
@@ -295,9 +384,20 @@ struct Idem<'a> {
     path: &'a str,
     hash: String,
 }
-async fn cached(db: &mut Conn, i: &Idem<'_>) -> Result<Option<Vec<u8>>> {
-    let row=sqlx::query("SELECT path,request_hash,response,intent_id FROM idempotency WHERE caller=? AND operation=? AND idem_key=?")
-      .bind(i.caller).bind(i.operation).bind(i.key).fetch_optional(db).await?;
+fn json_reply(status: StatusCode, bytes: Vec<u8>) -> Response {
+    (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response()
+}
+
+async fn cached(db: &mut Conn, i: &Idem<'_>) -> Result<Option<Response>> {
+    let row = sqlx::query(
+        "SELECT path, request_hash, status, response, intent_id FROM idempotency WHERE caller=? AND
+         operation=? AND idem_key=?",
+    )
+    .bind(i.caller)
+    .bind(i.operation)
+    .bind(i.key)
+    .fetch_optional(db)
+    .await?;
     let Some(row) = row else {
         return Ok(None);
     };
@@ -309,12 +409,70 @@ async fn cached(db: &mut Conn, i: &Idem<'_>) -> Result<Option<Vec<u8>>> {
     {
         return Ok(None);
     }
-    Ok(Some(row.get("response")))
+    let saved_status: u16 = row.get("status");
+    let status = StatusCode::from_u16(saved_status).map_err(|_| ApiError::store())?;
+    Ok(Some(json_reply(status, row.get("response"))))
 }
-async fn save(db: &mut Conn, i: &Idem<'_>, response: &[u8], intent: Option<&str>) -> Result<()> {
-    sqlx::query("INSERT INTO idempotency(caller,operation,idem_key,path,request_hash,status,response,intent_id) VALUES(?,?,?,?,?,200,?,?) ON CONFLICT(caller,operation,idem_key) DO UPDATE SET response=excluded.response")
-        .bind(i.caller).bind(i.operation).bind(i.key).bind(i.path).bind(&i.hash).bind(response).bind(intent).execute(db).await?;
+
+async fn save(
+    db: &mut Conn,
+    i: &Idem<'_>,
+    status: StatusCode,
+    body: &[u8],
+    intent: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO idempotency(caller, operation, idem_key, path, request_hash, status,
+         response, intent_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(caller, operation,
+         idem_key) DO UPDATE SET status=excluded.status, response=excluded.response",
+    )
+    .bind(i.caller)
+    .bind(i.operation)
+    .bind(i.key)
+    .bind(i.path)
+    .bind(&i.hash)
+    .bind(i64::from(status.as_u16()))
+    .bind(body)
+    .bind(intent)
+    .execute(db)
+    .await?;
     Ok(())
+}
+
+// Keep a rejected authenticated request replayable while rolling back its partial writes.
+async fn finish(
+    mut tx: sqlx::Transaction<'_, sqlx::Sqlite>,
+    i: &Idem<'_>,
+    result: Result<Vec<u8>>,
+    intent: Option<&str>,
+) -> Result<Response> {
+    let (status, body) = match result {
+        Ok(bytes) => (StatusCode::OK, bytes),
+        Err(error) => {
+            sqlx::query("ROLLBACK TO request_writes")
+                .execute(&mut *tx)
+                .await?;
+            (
+                error.0,
+                json_bytes(json!({"error":{"code":error.1,"message":error.1}}))?,
+            )
+        }
+    };
+    save(&mut tx, i, status, &body, intent).await?;
+    tx.commit().await?;
+    Ok(json_reply(status, body))
+}
+
+async fn set_clock(db: &mut Conn, bytes: &[u8]) -> Result<Vec<u8>> {
+    let target = timestamp(field(&canonical::parse(bytes)?, "clock")?)?;
+    if target < db::clock(db).await? {
+        return Err(ApiError::conflict("STATE_CONFLICT"));
+    }
+    sqlx::query("UPDATE deployment SET clock=?")
+        .bind(target.to_string())
+        .execute(db)
+        .await?;
+    json_bytes(json!({"clock":target.to_string()}))
 }
 
 async fn upload(
@@ -349,6 +507,12 @@ async fn upload(
         let id = random()?;
         let dir = s.config.artifact_root.join(&id[..2]);
         tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|_| ApiError::store())?;
+        tokio::fs::File::open(&s.config.artifact_root)
+            .await
+            .map_err(|_| ApiError::store())?
+            .sync_all()
             .await
             .map_err(|_| ApiError::store())?;
         let mut file = tokio::fs::OpenOptions::new()
@@ -387,6 +551,21 @@ async fn upload(
     json_bytes(json!({"content_id":id,"length":length.to_string(),"digest":hash}))
 }
 
+fn authorized_action(role: &str, bytes: &[u8]) -> Result<Value> {
+    let cmd = canonical::parse(bytes)?;
+    let allowed = match field(&cmd, "action")? {
+        "fund" => role == "buyer" || role == "seller",
+        "commit_delivery" => role == "seller",
+        "release" => role == "verifier",
+        "refund" => true,
+        _ => return Err(ApiError::bad("BAD_ENCODING")),
+    };
+    if !allowed {
+        return Err(ApiError::denied("ROLE_FORBIDDEN"));
+    }
+    Ok(cmd)
+}
+
 async fn post(
     s: &State,
     uri: &Uri,
@@ -394,7 +573,7 @@ async fn post(
     h: &HeaderMap,
     key: &str,
     bytes: &[u8],
-) -> Result<Vec<u8>> {
+) -> Result<Response> {
     match path {
         ["v1", route @ ("offers" | "requests" | "quotes" | "acceptances" | "deliveries" | "verdicts"
         | "messages")] => {
@@ -409,9 +588,6 @@ async fn post(
                     | ("verdicts", "verdict")
                     | ("messages", _)
             );
-            if !valid {
-                return Err(ApiError::bad("UNSUPPORTED_KIND"));
-            }
             let i = Idem {
                 caller: &msg.unsigned().issuer,
                 operation: route,
@@ -423,10 +599,15 @@ async fn post(
             if let Some(saved) = cached(&mut tx, &i).await? {
                 return Ok(saved);
             }
-            let result = db::publish(s, &mut tx, &msg, bytes).await?;
-            save(&mut tx, &i, &result, None).await?;
-            tx.commit().await?;
-            Ok(result)
+            sqlx::query("SAVEPOINT request_writes")
+                .execute(&mut *tx)
+                .await?;
+            let result = if valid {
+                db::publish(s, &mut tx, &msg, bytes).await
+            } else {
+                Err(ApiError::bad("UNSUPPORTED_KIND"))
+            };
+            finish(tx, &i, result, None).await
         }
         ["v1", "sim", "clock"] => {
             if h.get("x-sim-admin").and_then(|h| h.to_str().ok())
@@ -445,18 +626,11 @@ async fn post(
             if let Some(saved) = cached(&mut tx, &i).await? {
                 return Ok(saved);
             }
-            let target = timestamp(field(&canonical::parse(bytes)?, "clock")?)?;
-            if target < db::clock(&mut tx).await? {
-                return Err(ApiError::conflict("STATE_CONFLICT"));
-            }
-            sqlx::query("UPDATE deployment SET clock=?")
-                .bind(target.to_string())
+            sqlx::query("SAVEPOINT request_writes")
                 .execute(&mut *tx)
                 .await?;
-            let result = json_bytes(json!({"clock":target.to_string()}))?;
-            save(&mut tx, &i, &result, None).await?;
-            tx.commit().await?;
-            Ok(result)
+            let result = set_clock(&mut tx, bytes).await;
+            finish(tx, &i, result, None).await
         }
         ["v1", "orders", order, rest @ ..] => {
             hex::<32>(order)?;
@@ -486,23 +660,9 @@ async fn post(
                 authenticate(s, &Method::POST, uri, h).await?
             };
             require_member(s, order, &c, artifact).await?;
-            let (op, act) = match *rest {
-                ["artifacts"] if c.role == "seller" => ("artifacts", Value::Null),
-                ["artifacts"] => return Err(ApiError::denied("ARTIFACT_FORBIDDEN")),
-                ["actions", op @ ("prepare" | "submit")] => {
-                    let v = canonical::parse(bytes)?;
-                    let allowed = match field(&v, "action")? {
-                        "fund" => c.role == "buyer" || c.role == "seller",
-                        "commit_delivery" => c.role == "seller",
-                        "release" => c.role == "verifier",
-                        "refund" => true,
-                        _ => return Err(ApiError::bad("BAD_ENCODING")),
-                    };
-                    if !allowed {
-                        return Err(ApiError::denied("ROLE_FORBIDDEN"));
-                    }
-                    (op, v)
-                }
+            let op = match *rest {
+                ["artifacts"] => "artifacts",
+                ["actions", op @ ("prepare" | "submit")] => op,
                 _ => return Err(ApiError::missing()),
             };
             let i = Idem {
@@ -516,9 +676,30 @@ async fn post(
             if let Some(saved) = cached(&mut tx, &i).await? {
                 return Ok(saved);
             }
+            sqlx::query("SAVEPOINT request_writes")
+                .execute(&mut *tx)
+                .await?;
+            let act = if artifact {
+                if c.role != "seller" {
+                    return finish(tx, &i, Err(ApiError::denied("ARTIFACT_FORBIDDEN")), None).await;
+                }
+                Value::Null
+            } else {
+                match authorized_action(&c.role, bytes) {
+                    Ok(action) => action,
+                    Err(error) => return finish(tx, &i, Err(error), None).await,
+                }
+            };
             if op == "submit" {
-                let intent = actions::enqueue(s, &mut tx, order, &act).await?;
-                save(&mut tx, &i, &[], Some(&intent)).await?;
+                let intent = match actions::enqueue(s, &mut tx, order, &act).await {
+                    Ok(intent) => intent,
+                    Err(error) => return finish(tx, &i, Err(error), None).await,
+                };
+                let outcome = actions::status(&mut tx, order, &intent).await?;
+                if serde_json::from_slice::<Value>(&outcome)?["outcome"] != "pending" {
+                    return finish(tx, &i, Ok(outcome), Some(&intent)).await;
+                }
+                save(&mut tx, &i, StatusCode::OK, &[], Some(&intent)).await?;
                 tx.commit().await?;
                 #[cfg(debug_assertions)]
                 if std::env::var("SETTLE463_TEST_STOP").as_deref() == Ok("before_broadcast") {
@@ -527,18 +708,14 @@ async fn post(
                 actions::process(s, &intent).await?;
                 let mut tx = s.pool.begin_with("BEGIN IMMEDIATE").await?;
                 let response = actions::status(&mut tx, order, &intent).await?;
-                save(&mut tx, &i, &response, Some(&intent)).await?;
-                tx.commit().await?;
-                return Ok(response);
+                return finish(tx, &i, Ok(response), Some(&intent)).await;
             }
             let result = if artifact {
-                upload(s, &mut tx, order, h, bytes).await?
+                upload(s, &mut tx, order, h, bytes).await
             } else {
-                actions::prepare(s, &mut tx, order, &act).await?
+                actions::prepare(s, &mut tx, order, &act).await
             };
-            save(&mut tx, &i, &result, None).await?;
-            tx.commit().await?;
-            Ok(result)
+            finish(tx, &i, result, None).await
         }
         _ => Err(ApiError::missing()),
     }

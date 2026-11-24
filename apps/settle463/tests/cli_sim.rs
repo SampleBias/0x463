@@ -113,6 +113,13 @@ fn scenarios_and_fresh_process_receipts() {
         let bundle = Path::new(lines[8].1);
         let raw = fs::read(bundle).unwrap();
         let value: Value = serde_json::from_slice(&raw).unwrap();
+        let terms = &value["quote"]["body"];
+        let roles: std::collections::BTreeSet<_> =
+            ["buyer", "seller", "verifier", "receipt_issuer"]
+                .map(|name| terms[name].as_str().unwrap())
+                .into_iter()
+                .collect();
+        assert_eq!(roles.len(), 4);
         assert_eq!(value.get("delivery").is_some(), scenario != "no-delivery");
         assert_eq!(
             value.get("verdict").is_some(),
@@ -128,7 +135,16 @@ fn scenarios_and_fresh_process_receipts() {
                 "Refunded"
             }
         );
+        assert_eq!(state["order_id"], lines[0].1);
         assert_eq!(state["held"], "0");
+        if scenario == "bad-artifact" {
+            let v = &value["verdict"]["body"];
+            assert_eq!(v["decision"], "FAIL");
+            assert_ne!(
+                v["observed_digest"],
+                terms["acceptance_policy"]["expected_digest"]
+            );
+        }
         if scenario == "pass" {
             assert!(String::from_utf8_lossy(&out.stderr).contains("buyer_download length=52 sha256=37ba5c2e570e4e256af7049d0d9c27f70b50f5de4210101d7c0bd2b497db7587"));
             let mut broken = value.clone();
@@ -137,7 +153,9 @@ fn scenarios_and_fresh_process_receipts() {
             broken["receipt"]["signature"] = format!("{prefix}{}", &sig[1..]).into();
             let damaged = session.0.join("damaged.json");
             fs::write(&damaged, serde_json::to_vec(&broken).unwrap()).unwrap();
-            assert_eq!(session.verify(&damaged, &[]).status.code(), Some(2));
+            let rejected = session.verify(&damaged, &[]);
+            assert_eq!(rejected.status.code(), Some(2));
+            assert_eq!(rejected.stdout, b"invalid_evidence\n");
             assert_eq!(
                 session
                     .verify(bundle, &["--trusted-issuer", &"00".repeat(32)])
@@ -182,4 +200,111 @@ fn restart_after_funding_intent_commit_debits_exactly_once() {
         assert_eq!(view["buyer_balance"], "3000000");
         assert_eq!(view["seller_balance"], "0");
     }
+}
+
+struct Peer {
+    state: Session,
+    child: std::process::Child,
+    url: String,
+}
+impl Peer {
+    fn start(keys: &Value) -> Self {
+        use std::io::{BufRead, BufReader};
+        let state = Session::new();
+        fs::create_dir(&state.0).unwrap();
+        let key_file = state.0.join("issuer.key");
+        fs::write(&key_file, keys["coordinator"]["seed_hex"].as_str().unwrap()).unwrap();
+        let config = settle463d::Config {
+            database: state.0.join("db.sqlite"),
+            artifact_root: state.0.join("artifacts"),
+            issuer_seed_file: key_file,
+            environment: "sim:fixture".into(),
+            buyer: keys["buyer"]["public_key_hex"].as_str().unwrap().into(),
+            opening_balance: 5_000_000,
+            clock: 1_700_000_000,
+            admin_token: "a5".repeat(32),
+        };
+        let file = state.0.join("coordinator.json");
+        fs::write(&file, serde_json::to_vec(&config).unwrap()).unwrap();
+        let mut child = cli()
+            .args(["__serve", "--config"])
+            .arg(file)
+            .args(["--listen", "127.0.0.1:0"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        let addr = ready
+            .trim()
+            .strip_prefix("LISTEN=")
+            .expect("daemon should bind");
+        Self {
+            state,
+            child,
+            url: format!("http://{addr}"),
+        }
+    }
+}
+impl Drop for Peer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn direct_peer_transfers_signed_quote_to_second_coordinator_without_discovery() {
+    use settle463_core::{ident::hex, parse_signed, wire::Body};
+    use settle463_sdk::{DirectPeer, HttpCoordinator, Identity, MessageTransport, Role};
+    use std::sync::Arc;
+
+    let vector: Value = serde_json::from_slice(include_bytes!(
+        "../../../fixtures/golden/positive-signing-vector.json"
+    ))
+    .unwrap();
+    let keys = &vector["keys"];
+    let source = Peer::start(keys);
+    let destination = Peer::start(keys);
+    assert_ne!(source.url, destination.url);
+    assert_ne!(source.state.0, destination.state.0);
+    let connect = |url: &str, role, name: &str| {
+        let id = Identity::from_seed(&hex(keys[name]["seed_hex"].as_str().unwrap()).unwrap());
+        Arc::new(HttpCoordinator::new(url, "sim:fixture", id, role).unwrap())
+    };
+    let seller = connect(&source.url, Role::Seller, "seller");
+    let direct = DirectPeer(connect(&destination.url, Role::Seller, "seller"));
+    let buyer = connect(&destination.url, Role::Buyer, "buyer");
+    let offer = parse_signed(
+        include_bytes!("../../../spec/examples/worked-transaction/service_offer.json"),
+        "sim:fixture",
+    )
+    .unwrap();
+    let request = parse_signed(
+        include_bytes!("../../../spec/examples/worked-transaction/request.json"),
+        "sim:fixture",
+    )
+    .unwrap();
+    let quote = parse_signed(
+        include_bytes!("../../../spec/examples/worked-transaction/quote.json"),
+        "sim:fixture",
+    )
+    .unwrap();
+    let Body::Quote(q) = &quote.unsigned().payload else {
+        panic!("expected fixture quote")
+    };
+    let id = hex_string(quote.id());
+    for m in [&offer, &request, &quote] {
+        seller.publish(m.clone()).unwrap();
+    }
+    for m in [&offer, &request] {
+        direct.publish(m.clone()).unwrap();
+    }
+    assert!(buyer.fetch_for_order(&id, &q.order_id).is_err());
+    let signed = seller.fetch_for_order(&id, &q.order_id).unwrap();
+    direct.publish(signed).unwrap();
+    let received = buyer.fetch(&id).unwrap();
+    assert_eq!(received.to_wire().unwrap(), quote.to_wire().unwrap());
 }

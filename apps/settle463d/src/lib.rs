@@ -2,6 +2,8 @@
 mod actions;
 mod db;
 mod http;
+#[cfg(test)]
+mod tests;
 
 use axum::{
     http::StatusCode,
@@ -29,8 +31,9 @@ type BoxError = Box<dyn std::error::Error>;
 type Result<T> = std::result::Result<T, ApiError>;
 type Conn = sqlx::SqliteConnection;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Simulator genesis and local storage. Existing databases pin their genesis and receipt issuer.
 pub struct Config {
     pub database: PathBuf,
     pub artifact_root: PathBuf,
@@ -219,8 +222,17 @@ async fn open(c: Config) -> std::result::Result<Shared, BoxError> {
         .bind(&issuer)
         .execute(&mut *tx)
         .await?;
-    let matches:i64=sqlx::query_scalar("SELECT count(*) FROM deployment WHERE environment=? AND genesis_clock=? AND buyer=? AND opening_balance=? AND receipt_issuer=?")
-        .bind(&c.environment).bind(c.clock.to_string()).bind(&c.buyer).bind(c.opening_balance.to_string()).bind(issuer).fetch_one(&mut *tx).await?;
+    let matches: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM deployment WHERE environment=? AND genesis_clock=? AND buyer=?
+         AND opening_balance=? AND receipt_issuer=?",
+    )
+    .bind(&c.environment)
+    .bind(c.clock.to_string())
+    .bind(&c.buyer)
+    .bind(c.opening_balance.to_string())
+    .bind(issuer)
+    .fetch_one(&mut *tx)
+    .await?;
     if matches != 1 {
         return Err("existing database belongs to a different genesis or receipt issuer".into());
     }
@@ -234,16 +246,34 @@ async fn open(c: Config) -> std::result::Result<Shared, BoxError> {
     Ok(state)
 }
 
+/// Recovers committed intents before announcing the bound loopback address.
 pub async fn serve(config: Config, listener: TcpListener) -> std::result::Result<(), BoxError> {
     if !listener.local_addr()?.ip().is_loopback() {
         return Err("simulator listener requires loopback".into());
     }
     let state = open(config).await?;
-    let app = Router::new().fallback(http::dispatch).with_state(state);
+    let app = Router::new()
+        .fallback(http::dispatch)
+        .with_state(state.clone());
+    let worker = tokio::spawn(async move {
+        // The crash test must terminate at the staging boundary before any worker can broadcast.
+        #[cfg(debug_assertions)]
+        if std::env::var("SETTLE463_TEST_STOP").as_deref() == Ok("before_broadcast") {
+            return;
+        }
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if let Err(error) = actions::recover(&state).await {
+                eprintln!("outbox recovery: {error}");
+            }
+        }
+    });
     println!("LISTEN={}", listener.local_addr()?);
-    axum::serve(listener, app).await?;
-    Ok(())
+    let result = axum::serve(listener, app).await;
+    worker.abort();
+    Ok(result?)
 }
+/// Runs the standalone daemon with `--config FILE` and optional `--listen LOOPBACK:PORT`.
 pub fn run_cli(args: &[String]) -> std::result::Result<(), BoxError> {
     let mut config = None;
     let mut address = "127.0.0.1:0".to_owned();

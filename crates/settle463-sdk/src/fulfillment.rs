@@ -5,6 +5,7 @@ use crate::{
 };
 use ed25519_dalek::Signer;
 use settle463_core::{
+    artifact::MAX_BYTES,
     ident::{decimal, hex, hex_string, timestamp},
     message_id, parse_signed,
     settlement::{Action, Agreement, Review, Submission},
@@ -49,10 +50,18 @@ impl Actor {
         }
         let id = m.map(|v| hex_string(v.id()));
         let key = self.identity.public_hex();
-        let valid=match action{
-            Action::CommitDelivery=>key==expected.seller && review.delivery_id==id && review.verdict_id.is_none(),
-            Action::Release=>key==expected.verifier && review.verdict_id==id && m.is_some_and(|msg|matches!(&msg.unsigned().payload,Body::Verdict(v) if Some(&v.delivery_id)==review.delivery_id.as_ref() && v.decision=="PASS")),
-            Action::Refund=>key==expected.buyer,
+        let valid = match (action, m.map(|msg| &msg.unsigned().payload)) {
+            (Action::CommitDelivery, Some(Body::Delivery(_))) => {
+                key == expected.seller && review.delivery_id == id && review.verdict_id.is_none()
+            }
+            (Action::Release, Some(Body::Verdict(v))) => {
+                key == expected.verifier
+                    && v.decision == "PASS"
+                    && review.verdict_id == id
+                    && review.delivery_id.as_ref() == Some(&v.delivery_id)
+            }
+            (Action::Refund, None) => key == expected.buyer && review.verdict_id.is_none(),
+            _ => false,
         };
         if !valid {
             return Err(Error::PolicyRejected);
@@ -203,31 +212,36 @@ impl VerifierClient {
         }
         let resolve = timestamp(&terms.deadlines.resolve_by)?;
         let now = self.actor.backend.clock()?;
-        let bytes = if now >= resolve {
-            None
+        let declared = decimal(&d.length)?;
+        let draft = if declared > MAX_BYTES as u64 {
+            settle463_verify::declared_oversized(now, resolve)
         } else {
-            match self.fetch_artifact(&terms.order_id, &d.content_id) {
-                Ok(bytes) => Some(bytes),
-                Err(
-                    Error::Unavailable
-                    | Error::Http {
-                        status: 503 | 404, ..
-                    },
-                ) => None,
-                Err(e) => return Err(e),
+            let bytes = if now >= resolve {
+                None
+            } else {
+                match self.fetch_artifact(&terms.order_id, &d.content_id) {
+                    Ok(bytes) => Some(bytes),
+                    Err(
+                        Error::Unavailable
+                        | Error::Http {
+                            status: 503 | 404, ..
+                        },
+                    ) => None,
+                    Err(e) => return Err(e),
+                }
+            };
+            if let Some(b) = &bytes {
+                if hex_string(&message_id(b)) != d.digest || declared != b.len() as u64 {
+                    return Err(Error::Linkage);
+                }
             }
+            settle463_verify::judge(
+                bytes.as_deref(),
+                &q.acceptance_policy,
+                self.actor.backend.clock()?,
+                resolve,
+            )
         };
-        if let Some(b) = &bytes {
-            if hex_string(&message_id(b)) != d.digest || decimal(&d.length)? != b.len() as u64 {
-                return Err(Error::Linkage);
-            }
-        }
-        let draft = settle463_verify::judge(
-            bytes.as_deref(),
-            &q.acceptance_policy,
-            self.actor.backend.clock()?,
-            resolve,
-        );
         let v = Verdict {
             order_id: terms.order_id,
             quote_id: terms.quote_id,
