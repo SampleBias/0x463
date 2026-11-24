@@ -22,7 +22,7 @@ use settle463_core::{
 use sqlx::{
     migrate::{Migration, MigrationType, Migrator},
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
-    SqlitePool,
+    Connection, SqlitePool,
 };
 use std::{path::PathBuf, sync::Arc};
 use tokio::net::TcpListener;
@@ -177,6 +177,41 @@ fn json_bytes(v: Value) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&v)?)
 }
 
+fn check_sqlite_version(reported: &str) -> std::result::Result<(), String> {
+    let malformed = || format!("unrecognized SQLite version {reported:?}");
+    let mut components = reported.split('.');
+    let mut version = [0u32; 3];
+    for value in &mut version {
+        let digits = components.next().ok_or_else(malformed)?;
+        if digits.is_empty()
+            || !digits.bytes().all(|b| b.is_ascii_digit())
+            || (digits.len() > 1 && digits.starts_with('0'))
+        {
+            return Err(malformed());
+        }
+        *value = digits.parse().map_err(|_| malformed())?;
+    }
+    if components.next().is_some() {
+        return Err(malformed());
+    }
+    if version < [3, 54, 0] {
+        return Err(format!(
+            "linked SQLite {reported} is below the required 3.54.0 (RUSTSEC-2026-0459)"
+        ));
+    }
+    Ok(())
+}
+
+async fn check_sqlite_runtime() -> std::result::Result<(), BoxError> {
+    let mut db = Conn::connect("sqlite::memory:").await?;
+    let version: String = sqlx::query_scalar("SELECT sqlite_version()")
+        .fetch_one(&mut db)
+        .await?;
+    check_sqlite_version(&version)?;
+    db.close().await?;
+    Ok(())
+}
+
 async fn open(c: Config) -> std::result::Result<Shared, BoxError> {
     environment(&c.environment)?;
     if !c.environment.starts_with("sim:") || c.clock < 0 {
@@ -184,6 +219,7 @@ async fn open(c: Config) -> std::result::Result<Shared, BoxError> {
     }
     hex::<32>(&c.buyer)?;
     hex::<32>(&c.admin_token)?;
+    check_sqlite_runtime().await?;
     tokio::fs::create_dir_all(&c.artifact_root).await?;
     let key = SigningKey::from_bytes(&hex(tokio::fs::read_to_string(&c.issuer_seed_file)
         .await?

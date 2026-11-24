@@ -22,6 +22,33 @@ const ARTIFACT: &[u8] = include_bytes!("../../../fixtures/artifacts/reference.js
 const ORDER: &str = "8ed07cfeafd6b86b5c1a4501912ec6f1984442f1247bd79aca2a2f166433b51c";
 const ENV: &str = "sim:fixture";
 
+#[test]
+fn sqlite_runtime_version_requires_the_patched_release() {
+    for version in ["3.53.999", "3.9.99", "2.999.999"] {
+        assert!(check_sqlite_version(version)
+            .unwrap_err()
+            .contains("3.54.0"));
+    }
+    for version in ["3.54.0", "3.54.1", "3.100.0", "4.0.0"] {
+        assert_eq!(check_sqlite_version(version), Ok(()));
+    }
+    for invalid in [
+        "",
+        "3.54",
+        "3..0",
+        "+3.54.0",
+        "3.54.0.1",
+        "3.54.0-beta",
+        "3.54.0 ",
+        "3.054.0",
+        "4294967296.54.0",
+    ] {
+        assert!(check_sqlite_version(invalid)
+            .unwrap_err()
+            .contains("unrecognized"));
+    }
+}
+
 fn key(role: &str) -> SigningKey {
     let fixture: Value = serde_json::from_slice(include_bytes!(
         "../../../fixtures/golden/positive-signing-vector.json"
@@ -248,6 +275,9 @@ async fn upload(s: &Shared, bytes: &[u8], idem: &str) -> Reply {
 async fn direct_quote_preserves_wire_bytes_and_private_read_consumes_challenge() {
     let (_dir, s) = server().await;
     publish(&s, "/v1/messages", OFFER, "offer").await.ok();
+    let page = send(&s, "GET", "/v1/offers", &[], &[]).await;
+    assert!(page.ok().windows(OFFER.len()).any(|bytes| bytes == OFFER));
+    assert_eq!(page.json()["items"].as_array().unwrap().len(), 1);
     publish(&s, "/v1/messages", QUOTE, "premature")
         .await
         .error(404, "NOT_FOUND");

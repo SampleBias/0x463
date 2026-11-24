@@ -8,6 +8,10 @@ The [hosted spike](https://github.com/SampleBias/0x463/actions/runs/45425441171)
 
 The SPL dependency disables its defaults and enables `solana-v3`, `token` and `associated_token`. The first feature selects the Rust SDK family shared with `anchor-lang`'s default. Agave 4.1.2 ran the resulting binary. The root [Rust pin](../rust-toolchain.toml) and [Anchor configuration](../Anchor.toml) record the tested versions. The placeholder localnet address belongs to the disposable spike. Phase D replaces it.
 
+## Phase C SQLite
+
+The Phase C coordinator uses SQLx 0.8.6 and links to native SQLite through `pkg-config`. Install SQLite 3.54.0 or newer with its development library before building the service or CLI. Check the installed version with `pkg-config --modversion sqlite3`. The daemon checks the linked library on an in-memory connection before opening its database. CI builds SQLite 3.54.1 from the upstream archive and checks its SHA3-256. [SQLite releases](https://sqlite.org/download.html) · [WAL advisory](https://rustsec.org/advisories/RUSTSEC-2026-0459.html)
+
 ## Local development environment before pinning
 
 | Tool | Observed on 2026-11-24 |

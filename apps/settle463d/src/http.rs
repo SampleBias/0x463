@@ -226,11 +226,19 @@ fn paged(mut rows: Vec<(i64, Vec<u8>)>, n: i64) -> Result<Vec<u8>> {
     } else {
         None
     };
-    let list = rows
-        .iter()
-        .map(|r| serde_json::from_slice::<Value>(&r.1))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    json_bytes(json!({"items":list,"next_cursor":cursor}))
+    // Each row is one validated JSON value. Embed its original bytes to preserve signed offers.
+    let mut page = br#"{"items":["#.to_vec();
+    for (position, (_, bytes)) in rows.into_iter().enumerate() {
+        serde_json::from_slice::<serde::de::IgnoredAny>(&bytes)?;
+        if position != 0 {
+            page.push(b',');
+        }
+        page.extend_from_slice(&bytes);
+    }
+    page.extend_from_slice(br#"],"next_cursor":"#);
+    serde_json::to_writer(&mut page, &cursor)?;
+    page.push(b'}');
+    Ok(page)
 }
 async fn private_message(s: &State, uri: &Uri, headers: &HeaderMap, id: &str) -> Result<Vec<u8>> {
     let caller = authenticate(s, &Method::GET, uri, headers).await?;
