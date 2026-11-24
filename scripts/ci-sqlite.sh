@@ -16,9 +16,12 @@ if sha3_256(Path("sqlite.tar.gz").read_bytes()).hexdigest() != expected:
 PY
 tar -xzf sqlite.tar.gz
 cd sqlite-autoconf-3540100
-./configure --prefix="$prefix"
+CFLAGS="-O2 -DSQLITE_ENABLE_COLUMN_METADATA -DSQLITE_ENABLE_UNLOCK_NOTIFY" ./configure --prefix="$prefix"
 make -j2
 make install
 echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig" >> "$GITHUB_ENV"
 echo "LD_LIBRARY_PATH=$prefix/lib" >> "$GITHUB_ENV"
 LD_LIBRARY_PATH="$prefix/lib" "$prefix/bin/sqlite3" -version
+features=$(LD_LIBRARY_PATH="$prefix/lib" "$prefix/bin/sqlite3" :memory: \
+  "SELECT sqlite_compileoption_used('ENABLE_COLUMN_METADATA'), sqlite_compileoption_used('ENABLE_UNLOCK_NOTIFY')")
+test "$features" = '1|1'

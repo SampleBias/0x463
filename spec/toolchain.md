@@ -10,7 +10,7 @@ The SPL dependency disables its defaults and enables `solana-v3`, `token` and `a
 
 ## Phase C SQLite
 
-The Phase C coordinator uses SQLx 0.8.6 and links to native SQLite through `pkg-config`. Install SQLite 3.54.0 or newer with its development library before building the service or CLI. Check the installed version with `pkg-config --modversion sqlite3`. The daemon checks the linked library on an in-memory connection before opening its database. CI builds SQLite 3.54.1 from the upstream archive and checks its SHA3-256. [SQLite releases](https://sqlite.org/download.html) · [WAL advisory](https://rustsec.org/advisories/RUSTSEC-2026-0459.html)
+The Phase C coordinator uses SQLx 0.8.6 and links to native SQLite through `pkg-config`. Install SQLite 3.54.0 or newer with its development library before building the service or CLI. SQLx requires the SQLite build options `SQLITE_ENABLE_COLUMN_METADATA` and `SQLITE_ENABLE_UNLOCK_NOTIFY`. Check the installed version with `pkg-config --modversion sqlite3`. The daemon checks the linked library on an in-memory connection before opening its database. CI builds SQLite 3.54.1 from the upstream archive and checks its SHA3-256. [SQLite releases](https://sqlite.org/download.html) · [WAL advisory](https://rustsec.org/advisories/RUSTSEC-2026-0459.html)
 
 ## Local development environment before pinning
 
