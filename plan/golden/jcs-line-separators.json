@@ -1,0 +1,4 @@
+{
+  "input_json": "{\"\\u2028\":\"\\u2029\"}",
+  "canonical_utf8_hex": "7b22e280a8223a22e280a9227d"
+}
