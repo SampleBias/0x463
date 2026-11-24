@@ -1,7 +1,9 @@
 //! Signed wire messages and identifiers for version 0.1 of the 0x463 protocol.
 
+pub mod artifact;
 pub mod canonical;
 pub mod ident;
+pub mod receipt;
 pub mod settlement;
 mod validate;
 pub mod wire;

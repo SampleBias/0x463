@@ -15,8 +15,14 @@ jobs:
           "$RUNNER_TEMP/fixture-env/bin/pip" install cryptography==50.0.2
           echo "$RUNNER_TEMP/fixture-env/bin" >> "$GITHUB_PATH"
       - run: cargo fmt --all --check
-      - run: cargo clippy -p settle463-core --all-targets -- -D warnings
-      - run: cargo test --locked -p settle463-core
+      - run: cargo clippy --locked -p settle463-core -p settle463-verify -p settle463-sim -p settle463-sdk -p settle463d -p settle463 --all-targets -- -D warnings
+      - run: cargo test --locked -p settle463-core -p settle463-verify -p settle463-sim -p settle463-sdk -p settle463d -p settle463
       - run: python3 fixtures/tools/independent_vector.py
-      - run: cargo clippy --locked -p settle463-sim -p settle463-sdk --all-targets -- -D warnings
-      - run: cargo test --locked -p settle463-sim -p settle463-sdk
+      - name: Exercise public CLI and independently verify each receipt
+        run: python3 scripts/phase-c-scenarios.py "$RUNNER_TEMP/phase-c-evidence"
+      - name: Retain public receipts and transcripts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: phase-c-simulator-evidence
+          path: ${{ runner.temp }}/phase-c-evidence
+          if-no-files-found: error

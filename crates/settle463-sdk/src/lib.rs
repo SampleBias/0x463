@@ -1,6 +1,10 @@
 //! Signed buyer and seller negotiation over a replaceable message transport.
 
+mod fulfillment;
+mod http;
 mod transport;
+pub use fulfillment::{StoredArtifact, VerifierClient};
+pub use http::{DirectPeer, HttpCoordinator, Role};
 pub use settle463_core::settlement::SettlementBackend;
 pub use transport::{MemoryTransport, MessageTransport};
 
@@ -26,6 +30,10 @@ pub enum Error {
     Environment,
     #[error("LINKAGE_FAILED")]
     Linkage,
+    #[error("HTTP {status}: {code}")]
+    Http { status: u16, code: String },
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
     #[error("message not found")]
     NotFound,
     #[error("message store or randomness unavailable")]
@@ -50,6 +58,7 @@ fn random_seed() -> Result<[u8; 32]> {
     getrandom::getrandom(&mut bytes).map_err(|_| Error::Unavailable)?;
     Ok(bytes)
 }
+#[derive(Clone)]
 pub struct Identity(SigningKey);
 impl Identity {
     pub fn generate() -> Result<Self> {
@@ -121,6 +130,7 @@ struct Actor {
     identity: Identity,
     transport: Arc<dyn MessageTransport>,
     backend: Arc<dyn SettlementBackend>,
+    http: Option<Arc<HttpCoordinator>>,
 }
 impl Actor {
     fn env(&self) -> &str {
@@ -179,6 +189,7 @@ impl BuyerClient {
                 identity,
                 transport,
                 backend,
+                http: None,
             },
             policy,
         }
@@ -325,6 +336,7 @@ impl SellerClient {
                 identity,
                 transport,
                 backend,
+                http: None,
             },
             policy,
         }

@@ -11,6 +11,9 @@ ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] 
 getrandom = "0.2"
 thiserror = "2"
 
+serde_json = "1"
+ureq = { version = "=2.12.1", default-features = false }
+settle463-verify = { path = "../settle463-verify" }
+
 [dev-dependencies]
 settle463-sim = { path = "../settle463-sim" }
-serde_json = "1"

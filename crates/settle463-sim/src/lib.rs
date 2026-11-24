@@ -1,10 +1,12 @@
 //! In-memory settlement ledger with a controllable clock and atomic funding.
 
-use settle463_core::ident::{decimal, hex, hex_string, timestamp};
+use settle463_core::ident::{decimal, environment, hex, hex_string, timestamp};
 use settle463_core::settlement::{
-    Agreement, ChainOutcome, FundSignatures, FundingError, OrderState, OrderView, PreparedFund,
-    Result, Review, SettlementBackend, Submission,
+    check_pass_policy, check_verdict, Action, ActionReview, Agreement, ChainOutcome,
+    FundSignatures, FundingError, OrderState, OrderView, PreparedFund, Result, Review,
+    SettlementBackend, Submission,
 };
+use settle463_core::{wire::Artifact, SignedMessage};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
@@ -26,7 +28,10 @@ struct Ledger {
     balances: HashMap<(String, String), u64>,
     orders: HashMap<String, OrderView>,
     transfers: Vec<Transfer>,
-    pending: HashMap<String, Review>,
+    pending: HashMap<String, (Review, Artifact)>,
+    artifacts: HashMap<String, Artifact>,
+    deliveries: HashMap<String, SignedMessage>,
+    pending_actions: HashMap<String, (ActionReview, Option<SignedMessage>)>,
     pending_orders: HashMap<String, String>,
     outcomes: HashMap<String, ChainOutcome>,
 }
@@ -39,7 +44,18 @@ pub struct Simulator {
 impl Simulator {
     /// Creates an isolated deployment. Opening accounts must be unique party accounts.
     pub fn new(clock: i64, opening: impl IntoIterator<Item = (String, u64)>) -> Result<Self> {
-        if clock < 0 {
+        let mut id = [0u8; 16];
+        getrandom::getrandom(&mut id).map_err(|_| FundingError::Unavailable)?;
+        Self::with_environment(&format!("sim:{}", hex_string(&id)), clock, opening)
+    }
+    /// Restores the configuration of a deployment before replaying its command journal.
+    pub fn with_environment(
+        env: &str,
+        clock: i64,
+        opening: impl IntoIterator<Item = (String, u64)>,
+    ) -> Result<Self> {
+        environment(env)?;
+        if clock < 0 || !env.starts_with("sim:") {
             return Err(FundingError::InvalidGenesis);
         }
         let mut balances = HashMap::new();
@@ -55,10 +71,8 @@ impl Simulator {
                 return Err(FundingError::InvalidGenesis);
             }
         }
-        let mut id = [0u8; 16];
-        getrandom::getrandom(&mut id).map_err(|_| FundingError::Unavailable)?;
         Ok(Self {
-            environment: format!("sim:{}", hex_string(&id)),
+            environment: env.to_owned(),
             ledger: Mutex::new(Ledger {
                 clock,
                 manual: false,
@@ -67,6 +81,9 @@ impl Simulator {
                 transfers: Vec::new(),
                 pending: HashMap::new(),
                 pending_orders: HashMap::new(),
+                pending_actions: HashMap::new(),
+                artifacts: HashMap::new(),
+                deliveries: HashMap::new(),
                 outcomes: HashMap::new(),
             }),
         })
@@ -97,13 +114,21 @@ impl Simulator {
     /// Executes a previously submitted command against the current time and balances.
     pub fn finalize(&self, intent_id: &str) -> Result<ChainOutcome> {
         let mut ledger = self.ledger()?;
-        let Some(review) = ledger.pending.remove(intent_id) else {
+        let result = if let Some((review, artifact)) = ledger.pending.remove(intent_id) {
+            ledger.pending_orders.remove(&review.order_id);
+            ledger.apply(&review, &artifact, intent_id)
+        } else if let Some((review, evidence)) = ledger.pending_actions.remove(intent_id) {
+            ledger.apply_action(&review, evidence.as_ref(), intent_id)
+        } else {
             return Ok(ledger.outcome(intent_id));
         };
-        ledger.pending_orders.remove(&review.order_id);
-        let outcome = match ledger.apply(&review, intent_id) {
+        let outcome = match result {
             Ok(()) => ChainOutcome::FinalizedSuccess,
-            Err(FundingError::Deadline) => ChainOutcome::Expired,
+            Err(
+                FundingError::Deadline
+                | FundingError::DeliveryDeadline
+                | FundingError::ResolveDeadline,
+            ) => ChainOutcome::Expired,
             Err(_) => ChainOutcome::FinalizedFailure,
         };
         ledger.outcomes.insert(intent_id.to_owned(), outcome);
@@ -138,13 +163,14 @@ impl Ledger {
             .ok_or(FundingError::InsufficientFunds)?;
         Ok((amount, remainder))
     }
-    fn apply(&mut self, r: &Review, id: &str) -> Result<()> {
+    fn apply(&mut self, r: &Review, artifact: &Artifact, id: &str) -> Result<()> {
         let (amount, remainder) = self.check(r)?;
         // Only this order can create its hold account, and its order ID can fund once.
         self.balances
             .insert((r.buyer_destination.clone(), r.asset.id.clone()), remainder);
         self.balances
             .insert((r.escrow_account.clone(), r.asset.id.clone()), amount);
+        self.artifacts.insert(r.order_id.clone(), artifact.clone());
         self.orders.insert(
             r.order_id.clone(),
             OrderView {
@@ -153,6 +179,10 @@ impl Ledger {
                 held: amount,
                 paid: 0,
                 refunded: 0,
+                delivery_id: None,
+                verdict_id: None,
+                terminal_clock: None,
+                terminal_locator: None,
             },
         );
         self.transfers.push(Transfer {
@@ -182,6 +212,7 @@ impl SettlementBackend for Simulator {
     fn submit_fund(&self, fund: &PreparedFund, signatures: &FundSignatures) -> Result<Submission> {
         fund.check(self.environment())?;
         let review = &fund.review;
+        let (_, quote) = fund.agreement.terms(self.environment())?;
         let intent_id = signatures.verify(review)?;
         let mut ledger = self.ledger()?;
         if ledger.pending_orders.contains_key(&review.order_id) {
@@ -192,10 +223,73 @@ impl SettlementBackend for Simulator {
             ledger
                 .pending_orders
                 .insert(review.order_id.clone(), intent_id.clone());
-            ledger.pending.insert(intent_id.clone(), review.clone());
+            ledger
+                .pending
+                .insert(intent_id.clone(), (review.clone(), quote.artifact.clone()));
             ChainOutcome::Pending
         } else {
-            ledger.apply(review, &intent_id)?;
+            ledger.apply(review, &quote.artifact, &intent_id)?;
+            ChainOutcome::FinalizedSuccess
+        };
+        ledger.outcomes.insert(intent_id.clone(), outcome);
+        Ok(Submission { intent_id, outcome })
+    }
+    fn prepare_action(
+        &self,
+        order_id: &str,
+        action: Action,
+        evidence: Option<&SignedMessage>,
+    ) -> Result<ActionReview> {
+        let ledger = self.ledger()?;
+        let order = ledger
+            .orders
+            .get(order_id)
+            .ok_or(FundingError::OrderMissing)?;
+        let review = ActionReview::for_order(action, order, evidence)?;
+        if ledger.outcome(&review.intent_id()?) != ChainOutcome::FinalizedSuccess {
+            ledger.check_action(&review, evidence)?;
+        }
+        Ok(review)
+    }
+    fn submit_action(
+        &self,
+        review: &ActionReview,
+        evidence: Option<&SignedMessage>,
+        signature: Option<&[u8; 64]>,
+    ) -> Result<Submission> {
+        let intent_id = review.intent_id()?;
+        review.verify_authority(signature)?;
+        let mut ledger = self.ledger()?;
+        let order = ledger
+            .orders
+            .get(&review.terms.order_id)
+            .ok_or(FundingError::OrderMissing)?;
+        if ActionReview::for_order(review.action, order, evidence)? != *review {
+            return Err(FundingError::Linkage);
+        }
+        let prior = ledger.outcome(&intent_id);
+        if matches!(
+            prior,
+            ChainOutcome::FinalizedSuccess | ChainOutcome::Pending
+        ) {
+            return Ok(Submission {
+                intent_id,
+                outcome: prior,
+            });
+        }
+        let outcome = if ledger.manual {
+            ledger.check_action(review, evidence)?;
+            if ledger.pending_actions.values().any(|(r, _)| {
+                r.terms.order_id == review.terms.order_id && r.action == review.action
+            }) {
+                return Err(FundingError::Pending);
+            }
+            ledger
+                .pending_actions
+                .insert(intent_id.clone(), (review.clone(), evidence.cloned()));
+            ChainOutcome::Pending
+        } else {
+            ledger.apply_action(review, evidence, &intent_id)?;
             ChainOutcome::FinalizedSuccess
         };
         ledger.outcomes.insert(intent_id.clone(), outcome);
@@ -206,5 +300,115 @@ impl SettlementBackend for Simulator {
     }
     fn reconcile(&self, intent_id: &str) -> Result<ChainOutcome> {
         Ok(self.ledger()?.outcome(intent_id))
+    }
+}
+
+impl Ledger {
+    fn check_action(&self, r: &ActionReview, evidence: Option<&SignedMessage>) -> Result<()> {
+        let o = self
+            .orders
+            .get(&r.terms.order_id)
+            .ok_or(FundingError::OrderMissing)?;
+        if ActionReview::for_order(r.action, o, evidence)? != *r {
+            return Err(FundingError::Linkage);
+        }
+        match (r.action, o.state) {
+            (Action::CommitDelivery, OrderState::Funded) => {
+                if self.clock >= timestamp(&r.terms.deadlines.deliver_by)? {
+                    return Err(FundingError::DeliveryDeadline);
+                }
+            }
+            (Action::Release, OrderState::Delivered) => {
+                if self.clock >= timestamp(&r.terms.deadlines.resolve_by)? {
+                    return Err(FundingError::ResolveDeadline);
+                }
+                let delivery = self
+                    .deliveries
+                    .get(&r.terms.order_id)
+                    .ok_or(FundingError::Linkage)?;
+                let verdict = evidence.ok_or(FundingError::Linkage)?;
+                check_verdict(&r.terms, delivery, verdict)?;
+                check_pass_policy(
+                    self.artifacts
+                        .get(&r.terms.order_id)
+                        .ok_or(FundingError::Linkage)?,
+                    verdict,
+                )?;
+            }
+            (Action::Refund, OrderState::Funded | OrderState::Delivered) => {
+                let deadline = if o.state == OrderState::Funded {
+                    &r.terms.deadlines.deliver_by
+                } else {
+                    &r.terms.deadlines.resolve_by
+                };
+                if self.clock < timestamp(deadline)? {
+                    return Err(FundingError::TooEarly);
+                }
+            }
+            _ => return Err(FundingError::WrongState),
+        }
+        Ok(())
+    }
+    fn apply_action(
+        &mut self,
+        r: &ActionReview,
+        evidence: Option<&SignedMessage>,
+        id: &str,
+    ) -> Result<()> {
+        self.check_action(r, evidence)?;
+        let order_id = &r.terms.order_id;
+        let mut order = self
+            .orders
+            .get(order_id)
+            .ok_or(FundingError::OrderMissing)?
+            .clone();
+        if r.action == Action::CommitDelivery {
+            let delivery = evidence.ok_or(FundingError::Linkage)?;
+            order.state = OrderState::Delivered;
+            order.delivery_id = r.delivery_id.clone();
+            self.deliveries.insert(order_id.clone(), delivery.clone());
+        } else {
+            let amount = order.held;
+            let asset = &r.terms.asset.id;
+            let destination = if r.action == Action::Release {
+                &r.terms.seller_destination
+            } else {
+                &r.terms.buyer_destination
+            };
+            let balance = self
+                .balance(destination, asset)
+                .checked_add(amount)
+                .ok_or(FundingError::BalanceOverflow)?;
+            let remaining = self
+                .balance(&r.terms.escrow_account, asset)
+                .checked_sub(amount)
+                .ok_or(FundingError::InsufficientFunds)?;
+            self.balances
+                .insert((r.terms.escrow_account.clone(), asset.clone()), remaining);
+            self.balances
+                .insert((destination.clone(), asset.clone()), balance);
+            self.transfers.push(Transfer {
+                intent_id: id.to_owned(),
+                order_id: order_id.clone(),
+                asset_id: asset.clone(),
+                from: r.terms.escrow_account.clone(),
+                to: destination.clone(),
+                amount,
+            });
+            if r.action == Action::Release {
+                order.state = OrderState::Paid;
+                order.paid = amount;
+                order.verdict_id = r.verdict_id.clone();
+            } else {
+                order.state = OrderState::Refunded;
+                order.refunded = amount;
+            }
+            order.held = 0;
+            order.terminal_clock = Some(self.clock);
+            let seq = if order.delivery_id.is_some() { 3 } else { 2 };
+            order.terminal_locator = Some(format!("sim:{order_id}:{seq}"));
+        }
+        self.orders.insert(order_id.clone(), order);
+        Ok(())
     }
 }
