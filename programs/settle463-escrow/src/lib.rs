@@ -2,7 +2,7 @@
 
 use anchor_lang::{prelude::*, solana_program::bpf_loader_upgradeable, system_program};
 use anchor_spl::{
-    associated_token::get_associated_token_address_with_program_id,
+    associated_token::{self, get_associated_token_address_with_program_id, AssociatedToken},
     token::{self, Mint, TokenAccount, TransferChecked},
 };
 mod state;
@@ -16,7 +16,8 @@ pub mod settle463_escrow {
 
     pub fn initialize_config(ctx: Context<InitializeConfig>, genesis_hash: [u8; 32]) -> Result<()> {
         let a = ctx.accounts;
-        let data_address = bpf_loader_upgradeable::get_program_data_address(ctx.program_id);
+        let (data_address, _) =
+            Pubkey::find_program_address(&[ctx.program_id.as_ref()], &bpf_loader_upgradeable::ID);
         require_keys_eq!(
             a.program_data.key(),
             data_address,
@@ -88,7 +89,11 @@ pub mod settle463_escrow {
         let escrow_key = a.escrow.key();
         let mint = a.mint.key();
         check_ata(&a.buyer_destination, &buyer, &mint)?;
-        check_ata(&a.vault, &escrow_key, &mint)?;
+        require_keys_eq!(
+            a.vault.key(),
+            ata(&escrow_key, &mint),
+            EscrowError::Destination
+        );
         require_keys_eq!(
             a.seller_destination.key(),
             ata(&seller, &mint),
@@ -102,6 +107,20 @@ pub mod settle463_escrow {
         let bump = [ctx.bumps.escrow];
         let seeds = escrow_seeds(&buyer, &args.request_nonce, &bump);
         allocate_escrow(&a.escrow, &a.buyer, &[&seeds])?;
+        if *a.vault.owner == system_program::ID && a.vault.data_is_empty() {
+            associated_token::create_idempotent(CpiContext::new(
+                a.associated_token_program.key(),
+                associated_token::Create {
+                    payer: a.buyer.to_account_info(),
+                    associated_token: a.vault.to_account_info(),
+                    authority: a.escrow.to_account_info(),
+                    mint: a.mint.to_account_info(),
+                    system_program: a.system_program.to_account_info(),
+                    token_program: a.token_program.to_account_info(),
+                },
+            ))?;
+        }
+        check_ata(&a.vault, &escrow_key, &mint)?;
         move_principal(
             TransferChecked {
                 from: a.buyer_destination.to_account_info(),
@@ -331,6 +350,7 @@ pub struct Fund<'info> {
     /// CHECK: Must be the executable classic SPL Token program.
     pub token_program: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
 }
 
 #[derive(Accounts)]

@@ -1,12 +1,13 @@
 mod demo;
 mod session;
+mod validator;
 
 use serde_json::{json, Value};
 use settle463_core::{
     canonical,
     ident::{environment, hex},
     parse_signed,
-    receipt::{verify_sim_bundle, ReceiptError, ReceiptTrust},
+    receipt::{verify_sim_bundle, verify_solana_bundle, ReceiptError, ReceiptTrust},
     settlement::{Agreement, Review},
 };
 use settle463_sdk::{HttpCoordinator, Role};
@@ -34,7 +35,8 @@ impl Options {
                 "--offline" => out.offline = true,
                 "--backend" | "--scenario" | "--trust-file" | "--trusted-issuer"
                 | "--trusted-order" | "--trusted_issuer" | "--trusted_order" | "--environment"
-                | "--output-dir" | "--endpoint" | "--key-file" => {
+                | "--output-dir" | "--endpoint" | "--key-file" | "--deployment" | "--rpc"
+                | "--genesis" | "--program-id" => {
                     let value = it
                         .next()
                         .filter(|v| !v.starts_with("--"))
@@ -131,7 +133,7 @@ fn inspect(opts: &Options, order: &str) -> AnyResult<u8> {
         quote: signed("quote")?,
         acceptance: signed("acceptance")?,
     };
-    let pinned = Review::sim_fund(&agreement, &trust.environment)?;
+    let pinned = Review::from_agreement(&agreement, &trust.environment)?;
     if pinned.order_id != trust.trusted_order || pinned.receipt_issuer != trust.trusted_issuer {
         return Ok(3);
     }
@@ -171,17 +173,22 @@ fn run(args: &[String]) -> AnyResult<u8> {
     let opts = Options::parse(args)?;
     let cmd: Vec<_> = opts.args.iter().map(String::as_str).collect();
     match cmd.as_slice() {
-        ["demo"] if opts.get("--backend") == Some("sim") => run_demo(&opts),
-        ["receipt", "verify", bundle] if opts.offline => verify(&opts, bundle),
+        ["demo"] if matches!(opts.get("--backend"),Some("sim"|"local-validator")) => run_demo(&opts),
+        ["receipt", "verify", bundle] if opts.offline != opts.get("--rpc").is_some() => verify(&opts, bundle),
         ["order", "inspect", order] => inspect(&opts, order),
-        _ => Err("usage: settle463 demo --backend sim --scenario <scenario> | receipt verify <bundle> --offline --trust-file <file> | order inspect <id> --trust-file <file>".into()),
+        _ => Err("usage: settle463 demo --backend sim|local-validator --scenario <scenario> [--deployment <file>] | receipt verify <bundle> (--offline|--rpc <url>) --trust-file <file> | order inspect <id> --trust-file <file>".into()),
     }
 }
 
 fn run_demo(opts: &Options) -> AnyResult<u8> {
     let scenario = opts.get("--scenario").ok_or("missing --scenario")?;
     let dir = session::create_dir(opts.get("--output-dir"))?;
-    let result = demo::run(scenario, &dir)?;
+    let deployment = match (opts.get("--backend"), opts.get("--deployment")) {
+        (Some("local-validator"), Some(file)) => Some(Path::new(file)),
+        (Some("sim"), None) => None,
+        _ => return Err("a local-validator demo requires --deployment FILE".into()),
+    };
+    let result = demo::run(scenario, &dir, deployment)?;
     let keys = [
         "order_id",
         "backend",
@@ -200,8 +207,33 @@ fn run_demo(opts: &Options) -> AnyResult<u8> {
 fn verify(opts: &Options, bundle: &str) -> AnyResult<u8> {
     let trust = opts.trust()?;
     let bytes = fs::read(bundle)?;
-    let (code, label) = match verify_sim_bundle(&bytes, &trust) {
-        Ok(_) => (0, "evidence_signed"),
+    let checked = if trust.environment.starts_with("solana:") {
+        if let Some(url) = opts.get("--rpc") {
+            let mut pins = if let Some(file) = opts.get("--trust-file") {
+                canonical::parse(&fs::read(file)?)?
+            } else {
+                json!({})
+            };
+            for (flag, field) in [("--genesis", "genesis"), ("--program-id", "program_id")] {
+                if let Some(value) = opts.get(flag) {
+                    pins[field] = value.into();
+                }
+            }
+            if validator::check_pins(&pins, &trust.environment).is_err() {
+                Err(ReceiptError::InvalidEvidence)
+            } else {
+                verify_solana_bundle(&bytes, &trust).map(|v| validator::online(v, &trust, url))
+            }
+        } else {
+            verify_solana_bundle(&bytes, &trust).map(|_| (0, "evidence_signed"))
+        }
+    } else if opts.offline {
+        verify_sim_bundle(&bytes, &trust).map(|_| (0, "evidence_signed"))
+    } else {
+        return Err("online verification requires a pinned Solana deployment".into());
+    };
+    let (code, label) = match checked {
+        Ok(result) => result,
         Err(ReceiptError::InvalidEvidence) => (2, "invalid_evidence"),
         Err(ReceiptError::Untrusted) => (3, "untrusted"),
     };

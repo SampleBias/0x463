@@ -10,10 +10,10 @@ use settle463_core::{
 };
 use sqlx::Row;
 
-pub(crate) async fn ledger_clock(s:&State, db:&mut Conn)->Result<i64>{
+pub(crate) async fn ledger_clock(s: &State, db: &mut Conn) -> Result<i64> {
     match &s.chain {
-        Some(chain)=>chain.clock(),
-        None=>clock(db).await,
+        Some(chain) => chain.clock(),
+        None => clock(db).await,
     }
 }
 pub(crate) async fn clock(db: &mut Conn) -> Result<i64> {
@@ -255,7 +255,7 @@ pub(crate) async fn publish(
             };
             let (r, q) = agreement.terms(env)?;
             let review = Review::from_agreement(&agreement, env)?;
-            if ledger_clock(s,db).await? >= timestamp(&q.deadlines.fund_by)? {
+            if ledger_clock(s, db).await? >= timestamp(&q.deadlines.fund_by)? {
                 return Err(ApiError::conflict("STATE_CONFLICT"));
             }
             let n = sqlx::query("INSERT OR IGNORE INTO acceptances VALUES(?,?,?,?,?)")
@@ -345,7 +345,7 @@ pub(crate) async fn publish(
                 return Err(ApiError::conflict("STATE_CONFLICT"));
             }
             if v.decision != "INDETERMINATE"
-                && ledger_clock(s,db).await? >= timestamp(&q.deadlines.resolve_by)?
+                && ledger_clock(s, db).await? >= timestamp(&q.deadlines.resolve_by)?
             {
                 return Err(ApiError::conflict("STATE_CONFLICT"));
             }
@@ -415,11 +415,17 @@ pub(crate) async fn order_projection(s: &State, db: &mut Conn, order: &str) -> R
         .await?;
     let agreement = agreement(db, &s.config.environment, order).await?;
     let review = Review::from_agreement(&agreement, &s.config.environment)?;
-    let (buyer_balance,seller_balance) = if let Some(chain)=&s.chain {
-        (chain.balance(&review.buyer_destination)?,chain.balance(&review.seller_destination)?)
+    let (buyer_balance, seller_balance) = if let Some(chain) = &s.chain {
+        (
+            chain.balance(&review.buyer_destination)?,
+            chain.balance(&review.seller_destination)?,
+        )
     } else {
-        let sim=actions::restore(s, db).await?;
-        (sim.balance(&review.buyer_destination,&review.asset.id)?,sim.balance(&review.seller_destination,&review.asset.id)?)
+        let sim = actions::restore(s, db).await?;
+        (
+            sim.balance(&review.buyer_destination, &review.asset.id)?,
+            sim.balance(&review.seller_destination, &review.asset.id)?,
+        )
     };
     let sticky: Option<String> = row.get("definitive_id");
     let verdict = if let Some(id) = sticky {

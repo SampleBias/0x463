@@ -1,0 +1,57 @@
+name: Local validator conformance
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  validator:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install the pinned Anchor and Agave tools
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl --fail --location --retry 3 --output anchor https://github.com/otter-sec/anchor/releases/download/v1.2.2/anchor-1.2.2-x86_64-unknown-linux-gnu
+          curl --fail --location --retry 3 --output agave.tar.bz2 https://github.com/anza-xyz/agave/releases/download/v4.1.2/solana-release-x86_64-unknown-linux-gnu.tar.bz2
+          echo 'e2c35a973bcfe476f3a89b120e99820f917229faf33d3e71f6625bd94199e741  anchor' | sha256sum --check
+          echo '5991d027a686eb419a709a479178b33eb83501e8a2bfbf599a81a286bfcbf770  agave.tar.bz2' | sha256sum --check
+          install -Dm755 anchor "$RUNNER_TEMP/anchor-bin/anchor"
+          tar -xjf agave.tar.bz2
+          echo "$RUNNER_TEMP/anchor-bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/solana-release/bin" >> "$GITHUB_PATH"
+      - name: Build escrow for SBPF v3
+        run: |
+          anchor --version
+          solana --version
+          cargo-build-sbf --version
+          cargo-build-sbf --tools-version v1.57 --arch v3 --manifest-path programs/settle463-escrow/Cargo.toml --sbf-out-dir "$RUNNER_TEMP/escrow" -- --locked
+          sha256sum "$RUNNER_TEMP/escrow/settle463_escrow.so"
+      - name: Install native SQLite and the independent validator test driver
+        run: |
+          bash scripts/ci-sqlite.sh
+          python3 -m venv "$RUNNER_TEMP/validator-python"
+          "$RUNNER_TEMP/validator-python/bin/pip" install solders==0.26.0 cryptography==50.0.2
+          echo "$RUNNER_TEMP/validator-python/bin" >> "$GITHUB_PATH"
+      - name: Verify the locked host workspace
+        run: |
+          cargo fmt --all --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo clippy --locked -p settle463-escrow --features no-entrypoint --all-targets -- -D warnings
+          cargo test --locked --offline --workspace
+          cargo build --locked --offline -p settle463 -p settle463d
+      - name: Deploy, settle and verify against the private validator
+        run: |
+          bash tests/conformance/validator_setup.sh "$RUNNER_TEMP/escrow/settle463_escrow.so" \
+            python3 tests/conformance/validator_scenarios.py "$RUNNER_TEMP/validator-evidence"
+      - name: Retain public validator evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: phase-d-validator-evidence
+          path: ${{ runner.temp }}/validator-evidence/
+          if-no-files-found: error

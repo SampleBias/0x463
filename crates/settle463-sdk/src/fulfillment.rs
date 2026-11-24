@@ -49,13 +49,19 @@ impl Actor {
             let prior_delivery = match (action, m.map(|m| &m.unsigned().payload)) {
                 (Action::Release, Some(Body::Verdict(v))) => Some(v.delivery_id.clone()),
                 (Action::Refund, None) => http.order(&expected.order_id)?["delivery_id"]
-                    .as_str().map(str::to_owned),
+                    .as_str()
+                    .map(str::to_owned),
                 _ => None,
-            }.map(|id| http.fetch_for_order(&id, &expected.order_id)).transpose()?;
+            }
+            .map(|id| http.fetch_for_order(&id, &expected.order_id))
+            .transpose()?;
             let command = match (action, m) {
                 (Action::CommitDelivery, Some(msg)) => crate::LedgerAction::CommitDelivery(msg),
-                (Action::Release, Some(msg)) => crate::LedgerAction::Release(prior_delivery.as_ref().ok_or(Error::Linkage)?,msg),
-                (Action::Refund,None) => crate::LedgerAction::Refund(prior_delivery.as_ref()),
+                (Action::Release, Some(msg)) => crate::LedgerAction::Release(
+                    prior_delivery.as_ref().ok_or(Error::Linkage)?,
+                    msg,
+                ),
+                (Action::Refund, None) => crate::LedgerAction::Refund(prior_delivery.as_ref()),
                 _ => return Err(Error::Linkage),
             };
             return http.ledger_action(a, command, None);

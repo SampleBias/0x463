@@ -137,3 +137,64 @@ pub enum EscrowError {
     #[msg("Deadlines must be strictly increasing")]
     DeadlineOrder,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anchor_lang::Discriminator;
+
+    fn escrow(state: u8, delivery_set: u8) -> Escrow {
+        let bytes = [0u8; Escrow::INIT_SPACE];
+        let mut escrow = Escrow::deserialize(&mut bytes.as_slice()).unwrap();
+        escrow.state = state;
+        escrow.delivery_set = delivery_set;
+        escrow.deliver_by = 25;
+        escrow.resolve_by = 50;
+        escrow
+    }
+
+    #[test]
+    fn allocated_accounts_match_published_offsets() {
+        assert_eq!(Config::INIT_SPACE + Config::DISCRIMINATOR.len(), 106);
+        assert_eq!(Escrow::INIT_SPACE + Escrow::DISCRIMINATOR.len(), 698);
+        let mut sample = escrow(DELIVERED, 1);
+        sample.principal = 0x0102030405060708;
+        sample.environment_len = 3;
+        sample.environment[..3].copy_from_slice(b"abc");
+        let mut out = Vec::new();
+        sample.try_serialize(&mut out).unwrap();
+        assert_eq!(out.len(), 698);
+        assert_eq!(&out[456..464], &sample.principal.to_le_bytes());
+        assert_eq!(out[488], DELIVERED);
+        assert_eq!(out[521], 1);
+        assert_eq!(&out[556..560], b"\x03abc");
+    }
+
+    fn code(result: Result<()>) -> u32 {
+        match result.unwrap_err() {
+            anchor_lang::error::Error::AnchorError(err) => err.error_code_number,
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn terminal_state_and_ledger_deadline_boundaries() {
+        for (time, allowed) in [(24, true), (25, false), (26, false)] {
+            let funded = escrow(FUNDED, 0);
+            assert_eq!(funded.allow_delivery(time).is_ok(), allowed);
+            assert_eq!(funded.allow_refund(time).is_ok(), !allowed);
+        }
+        let delivered = escrow(DELIVERED, 1);
+        for (time, allowed) in [(49, true), (50, false), (51, false)] {
+            assert_eq!(delivered.allow_release(time, &[0; 32]).is_ok(), allowed);
+            assert_eq!(delivered.allow_refund(time).is_ok(), !allowed);
+        }
+        assert_eq!(code(delivered.allow_release(49, &[5; 32])), 6011);
+        for state in [PAID, REFUNDED] {
+            let terminal = escrow(state, 1);
+            assert_eq!(code(terminal.allow_delivery(0)), 6006);
+            assert_eq!(code(terminal.allow_release(0, &[0; 32])), 6006);
+            assert_eq!(code(terminal.allow_refund(100)), 6006);
+        }
+    }
+}

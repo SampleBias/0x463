@@ -69,9 +69,6 @@ impl Identity {
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         Self(SigningKey::from_bytes(seed))
     }
-    pub fn signing_key(&self) -> &SigningKey {
-        &self.0
-    }
     pub fn public_hex(&self) -> String {
         hex_string(self.0.verifying_key().as_bytes())
     }
@@ -290,6 +287,15 @@ impl BuyerClient {
         transport::check_offer(&offer, request)?;
         self.request_policy(r)?;
         check_quote_request(quote, request).map_err(|_| Error::PolicyRejected)?;
+        if self.actor.env().starts_with("solana:") {
+            let ledger = self
+                .actor
+                .coordinator()?
+                .ledger
+                .as_deref()
+                .ok_or(Error::Unavailable)?;
+            policy(q.settlement == ledger.settlement(r)?)?;
+        }
         let fund = timestamp(&q.deadlines.fund_by)?;
         let deliver = timestamp(&q.deadlines.deliver_by)?;
         let resolve = timestamp(&q.deadlines.resolve_by)?;
@@ -402,7 +408,12 @@ impl SellerClient {
                     seller_destination: format!("sim:{}", r.seller),
                 }
             } else {
-                self.actor.coordinator()?.ledger.as_deref().ok_or(Error::Unavailable)?.settlement(r)?
+                self.actor
+                    .coordinator()?
+                    .ledger
+                    .as_deref()
+                    .ok_or(Error::Unavailable)?
+                    .settlement(r)?
             },
             deadlines: terms.deadlines,
             expires_at: terms.expires_at.to_string(),

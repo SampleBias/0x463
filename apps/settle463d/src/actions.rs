@@ -132,7 +132,9 @@ pub(super) async fn require_local_settlement(s: &State, db: &mut Conn, order: &s
 
 pub(crate) async fn prepare(s: &State, db: &mut Conn, order: &str, v: &Value) -> Result<Vec<u8>> {
     require_local_settlement(s, db, order).await?;
-    if let Some(chain)=&s.chain { return chain.prepare(s,db,order,v).await; }
+    if let Some(chain) = &s.chain {
+        return chain.prepare(s, db, order, v).await;
+    }
     check_fields(v, false)?;
     let sim = restore(s, db).await?;
     if field(v, "action")? == "fund" {
@@ -146,7 +148,9 @@ pub(crate) async fn prepare(s: &State, db: &mut Conn, order: &str, v: &Value) ->
 
 pub(crate) async fn enqueue(s: &State, db: &mut Conn, order: &str, v: &Value) -> Result<String> {
     require_local_settlement(s, db, order).await?;
-    if let Some(chain)=&s.chain { return chain.enqueue(s,db,order,v).await; }
+    if let Some(chain) = &s.chain {
+        return chain.enqueue(s, db, order, v).await;
+    }
     check_fields(v, true)?;
     let action = field(v, "action")?;
     let input = canonical::canonical(v)?;
@@ -199,7 +203,12 @@ pub(crate) async fn enqueue(s: &State, db: &mut Conn, order: &str, v: &Value) ->
     .await?;
     Ok(intent)
 }
-pub(super) async fn receipt(s: &State, db: &mut Conn, view: &OrderView, ledger:Option<&settle463_core::receipt::SolanaLedger>) -> Result<()> {
+pub(super) async fn receipt(
+    s: &State,
+    db: &mut Conn,
+    view: &OrderView,
+    ledger: Option<&settle463_core::receipt::SolanaLedger>,
+) -> Result<()> {
     let order = &view.review.order_id;
     require_local_settlement(s, db, order).await?;
     let a = db::agreement(db, &s.config.environment, order).await?;
@@ -228,8 +237,8 @@ pub(super) async fn receipt(s: &State, db: &mut Conn, view: &OrderView, ledger:O
         .as_ref()
         .filter(|m| matches!(&m.unsigned().payload,Body::Verdict(v) if v.decision=="FAIL"));
     let body = match ledger {
-        Some(_) => settle463_core::receipt::make_solana_receipt(view,fail)?,
-        None => settle463_core::receipt::make_sim_receipt(view,fail)?,
+        Some(_) => settle463_core::receipt::make_solana_receipt(view, fail)?,
+        None => settle463_core::receipt::make_sim_receipt(view, fail)?,
     };
     let receipt = db::issuer_sign(s, Body::Receipt(Box::new(body)))?;
     let id = hex_string(receipt.id());
@@ -255,8 +264,22 @@ pub(super) async fn receipt(s: &State, db: &mut Conn, view: &OrderView, ledger:O
         .map(|b| settle463_core::parse_signed(b, &s.config.environment))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let bundle = match ledger {
-        Some(ledger)=>settle463_core::receipt::build_solana_bundle(&a,delivery.as_ref(),verdict.as_ref(),&receipt,&observations,ledger)?,
-        None=>settle463_core::receipt::build_sim_bundle(&a,delivery.as_ref(),verdict.as_ref(),&receipt,&observations,view)?,
+        Some(ledger) => settle463_core::receipt::build_solana_bundle(
+            &a,
+            delivery.as_ref(),
+            verdict.as_ref(),
+            &receipt,
+            &observations,
+            ledger,
+        )?,
+        None => settle463_core::receipt::build_sim_bundle(
+            &a,
+            delivery.as_ref(),
+            verdict.as_ref(),
+            &receipt,
+            &observations,
+            view,
+        )?,
     };
     sqlx::query("INSERT INTO receipts VALUES(?,?,?)")
         .bind(order)
@@ -268,7 +291,9 @@ pub(super) async fn receipt(s: &State, db: &mut Conn, view: &OrderView, ledger:O
 }
 
 pub(crate) async fn process(s: &State, id: &str) -> Result<()> {
-    if let Some(chain)=&s.chain {return chain.process(s,id).await;}
+    if let Some(chain) = &s.chain {
+        return chain.process(s, id).await;
+    }
     let mut tx = s.pool.begin_with("BEGIN IMMEDIATE").await?;
     let row =
         sqlx::query("SELECT order_id,action,signed_bytes,state FROM intents WHERE intent_id=?")
@@ -388,7 +413,13 @@ pub(crate) async fn recover(s: &State) -> Result<()> {
             .await?;
         }
     }
-    if let Some(chain)=&s.chain {chain.discover_refunds(s).await?;}
+    if let Some(chain) = &s.chain {
+        if let Err(e) = chain.discover_refunds(s).await {
+            if e.1 != "LEDGER_UNAVAILABLE" {
+                return Err(e);
+            }
+        }
+    }
     Ok(())
 }
 pub(crate) async fn status(db: &mut Conn, order: &str, id: &str) -> Result<Vec<u8>> {

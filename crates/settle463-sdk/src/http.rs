@@ -142,7 +142,7 @@ impl HttpCoordinator {
             .ok_or(Error::Environment)?
             .parse()
             .map_err(|_| Error::Environment)?;
-        if !addr.ip().is_loopback() || !env.starts_with("sim:") {
+        if !addr.ip().is_loopback() {
             return Err(Error::Environment);
         }
         let agent = ureq::AgentBuilder::new()
@@ -337,7 +337,12 @@ impl HttpCoordinator {
         }
         Ok(returned)
     }
-    pub(crate) fn submit_command(&self, order: &str, intent_id: String, command: Value) -> Result<Submission> {
+    pub(crate) fn submit_command(
+        &self,
+        order: &str,
+        intent_id: String,
+        command: Value,
+    ) -> Result<Submission> {
         // Retain the locally computed ID even if the server commits and the response is lost.
         self.intents
             .lock()
@@ -494,9 +499,12 @@ impl SettlementBackend for HttpCoordinator {
         &self.env
     }
     fn clock(&self) -> settle463_core::settlement::Result<i64> {
-        let v = self
-            .public_json("GET", "/v1/clock", None)
-            .map_err(funding)?;
+        let path = if self.env.starts_with("sim:") {
+            "/v1/sim/clock"
+        } else {
+            "/v1/clock"
+        };
+        let v = self.public_json("GET", path, None).map_err(funding)?;
         if v["environment"] != self.env {
             return Err(FundingError::Environment);
         }

@@ -219,11 +219,15 @@ async fn check_sqlite_runtime() -> std::result::Result<(), BoxError> {
 async fn open(c: Config) -> std::result::Result<Shared, BoxError> {
     environment(&c.environment)?;
     if c.environment.starts_with("solana:") != c.deployment.is_some() || c.clock < 0 {
-        return Err("invalid simulator environment or clock".into());
+        return Err("invalid backend deployment or initial clock".into());
     }
     hex::<32>(&c.buyer)?;
     hex::<32>(&c.admin_token)?;
-    let chain = c.deployment.as_ref().map(|deployment| chain::Chain::new(deployment, &c.environment)).transpose()?;
+    let chain = c
+        .deployment
+        .as_ref()
+        .map(|deployment| chain::Chain::new(deployment, &c.environment))
+        .transpose()?;
     check_sqlite_runtime().await?;
     tokio::fs::create_dir_all(&c.artifact_root).await?;
     let key = SigningKey::from_bytes(&hex(tokio::fs::read_to_string(&c.issuer_seed_file)
@@ -239,14 +243,22 @@ async fn open(c: Config) -> std::result::Result<Shared, BoxError> {
         .max_connections(1)
         .connect_with(options)
         .await?;
-    let migrations = vec![Migration::new(
-        1,
-        "coordinator".into(),
-        MigrationType::Simple,
-        include_str!("../migrations/0001_coordinator.sql").into(),
-        false,
-    ),Migration::new(2, "solana intents".into(), MigrationType::Simple,
-        include_str!("../migrations/0002_solana_intents.sql").into(), false)];
+    let migrations = vec![
+        Migration::new(
+            1,
+            "coordinator".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0001_coordinator.sql").into(),
+            false,
+        ),
+        Migration::new(
+            2,
+            "solana intents".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0002_solana_intents.sql").into(),
+            false,
+        ),
+    ];
     Migrator {
         migrations: migrations.into(),
         ..Migrator::DEFAULT

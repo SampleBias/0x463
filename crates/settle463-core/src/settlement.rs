@@ -223,22 +223,24 @@ pub struct Submission {
     pub outcome: ChainOutcome,
 }
 
-pub trait SettlementBackend: Send + Sync {
+pub trait SettlementBackend<F = PreparedFund, A = ActionReview, FS = FundSignatures, AS = [u8; 64]>:
+    Send + Sync
+{
     fn environment(&self) -> &str;
     fn clock(&self) -> Result<i64>;
-    fn prepare_fund(&self, agreement: Agreement) -> Result<PreparedFund>;
-    fn submit_fund(&self, fund: &PreparedFund, signatures: &FundSignatures) -> Result<Submission>;
+    fn prepare_fund(&self, agreement: Agreement) -> Result<F>;
+    fn submit_fund(&self, fund: &F, signatures: &FS) -> Result<Submission>;
     fn prepare_action(
         &self,
         order_id: &str,
         action: Action,
         evidence: Option<&SignedMessage>,
-    ) -> Result<ActionReview>;
+    ) -> Result<A>;
     fn submit_action(
         &self,
-        review: &ActionReview,
+        review: &A,
         evidence: Option<&SignedMessage>,
-        signature: Option<&[u8; 64]>,
+        signature: Option<&AS>,
     ) -> Result<Submission>;
     fn inspect(&self, order_id: &str) -> Result<Option<OrderView>>;
     fn reconcile(&self, intent_id: &str) -> Result<ChainOutcome>;

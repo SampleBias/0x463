@@ -13,3 +13,4 @@ serde_json = "1"
 getrandom = "0.2"
 
 settle463-solana = { path = "../../crates/settle463-solana" }
+bs58 = "0.5"

@@ -6,13 +6,13 @@ use serde_json::{json, Value};
 use settle463_core::{
     ident::{decimal, hex_string},
     parse_signed,
-    receipt::{verify_sim_bundle, ReceiptTrust},
-    settlement::{Agreement, ChainOutcome, FundSignatures},
-    wire::Body,
+    receipt::{verify_sim_bundle, verify_solana_bundle, ReceiptTrust},
+    settlement::{Agreement, ChainOutcome, Review},
+    wire::{Asset, Body, Deadlines, Settlement},
 };
 use settle463_sdk::{
     BuyerClient, BuyerPolicy, HttpCoordinator, QuoteTerms, RequestTerms, Role, SellerClient,
-    SellerPolicy, SettlementBackend, VerifierClient,
+    SellerPolicy, VerifierClient,
 };
 use std::{collections::BTreeSet, path::Path, sync::Arc};
 
@@ -20,26 +20,76 @@ const START: i64 = 1_700_000_000;
 const REFERENCE: &[u8] = include_bytes!("../../../fixtures/artifacts/reference.json");
 const CHANGED: &[u8] = include_bytes!("../../../fixtures/artifacts/one-byte-change.json");
 
-pub fn run(scenario: &str, dir: &Path) -> AnyResult<Value> {
+pub fn run(scenario: &str, dir: &Path, deployment: Option<&Path>) -> AnyResult<Value> {
     if !matches!(
         scenario,
         "pass" | "bad-artifact" | "no-delivery" | "verifier-offline"
     ) {
         return Err("unknown scenario".into());
     }
-    let buyer_id = session::key(dir, "buyer")?;
-    let seller_id = session::key(dir, "seller")?;
-    let verifier_id = session::key(dir, "verifier")?;
-    let issuer = session::key(dir, "issuer")?;
-    let env = format!("sim:{}", hex_string(&session::random()?[..16]));
+    let validator = deployment
+        .map(crate::validator::Validator::load)
+        .transpose()?
+        .map(Arc::new);
+    let key = |name: &str| -> AnyResult<_> {
+        if let Some(file) = deployment {
+            crate::validator::fixture_key(file, dir, name)
+        } else {
+            session::key(
+                dir,
+                if name == "coordinator" {
+                    "issuer"
+                } else {
+                    name
+                },
+            )
+        }
+    };
+    let buyer_id = key("buyer")?;
+    let seller_id = key("seller")?;
+    let verifier_id = key("verifier")?;
+    let issuer = key("coordinator")?;
+    let (env, start, asset, deadlines) = if let Some(v) = &validator {
+        let start = v.rpc.clock()?;
+        (
+            v.deployment.environment(),
+            start,
+            Asset {
+                kind: "spl-token".into(),
+                id: v.deployment.mint.clone(),
+                decimals: "6".into(),
+            },
+            Deadlines {
+                fund_by: (start + 45).to_string(),
+                deliver_by: (start + 65).to_string(),
+                resolve_by: (start + 95).to_string(),
+            },
+        )
+    } else {
+        (
+            format!("sim:{}", hex_string(&session::random()?[..16])),
+            START,
+            Asset {
+                kind: "sim".into(),
+                id: "test-six-decimal".into(),
+                decimals: "6".into(),
+            },
+            Deadlines {
+                fund_by: (START + 3600).to_string(),
+                deliver_by: (START + 7200).to_string(),
+                resolve_by: (START + 10800).to_string(),
+            },
+        )
+    };
     let token = hex_string(&session::random()?);
     let opening = 5_000_000u64;
     let config = dir.join("coordinator.json");
     let settings = settle463d::Config {
+        deployment: validator.as_ref().map(|v| v.deployment.clone()),
         database: dir.join("coordinator.sqlite"),
         artifact_root: dir.join("artifacts"),
         environment: env.clone(),
-        clock: START,
+        clock: start,
         buyer: buyer_id.public_hex(),
         opening_balance: opening,
         issuer_seed_file: dir.join("issuer.key"),
@@ -47,20 +97,18 @@ pub fn run(scenario: &str, dir: &Path) -> AnyResult<Value> {
     };
     session::private_write(&config, &serde_json::to_vec_pretty(&settings)?)?;
     let server = Server::start(&config)?;
-    let payer = Arc::new(HttpCoordinator::new(
-        &server.base,
-        &env,
-        buyer_id,
-        Role::Buyer,
-    )?);
+    let connect = |id, role| -> AnyResult<_> {
+        let http = HttpCoordinator::new(&server.base, &env, id, role)?;
+        Ok(Arc::new(if let Some(v) = &validator {
+            http.with_ledger(v.clone())
+        } else {
+            http
+        }))
+    };
+    let payer = connect(buyer_id, Role::Buyer)?;
     let seller_key = seller_id.public_hex();
     let verifier_key = verifier_id.public_hex();
-    let seller_http = Arc::new(HttpCoordinator::new(
-        &server.base,
-        &env,
-        seller_id,
-        Role::Seller,
-    )?);
+    let seller_http = connect(seller_id, Role::Seller)?;
     let verifiers = BTreeSet::from([verifier_key.clone()]);
     let environments = BTreeSet::from([env.clone()]);
     let buyer = BuyerClient::connect(
@@ -69,7 +117,7 @@ pub fn run(scenario: &str, dir: &Path) -> AnyResult<Value> {
             trusted_publishers: BTreeSet::from([seller_key]),
             max_principal: 2_500_000,
             allowed_services: BTreeSet::from(["sample-json-report".into()]),
-            allowed_assets: BTreeSet::from(["test-six-decimal".into()]),
+            allowed_assets: BTreeSet::from([asset.id.clone()]),
             allowed_environments: environments.clone(),
             allowed_verifiers: verifiers.clone(),
             max_deliver_window_seconds: 86400,
@@ -92,6 +140,7 @@ pub fn run(scenario: &str, dir: &Path) -> AnyResult<Value> {
         return Err("invalid offer fixture".into());
     };
     offer.environments = vec![env.clone()];
+    offer.expires_at = (start + 7200).to_string();
     seller.publish_offer(offer)?;
     let trusted = buyer.discover()?.pop().ok_or("no trusted offer")?;
     let fixture_quote = parse_signed(
@@ -104,11 +153,11 @@ pub fn run(scenario: &str, dir: &Path) -> AnyResult<Value> {
     let request = buyer.create_request(
         &trusted,
         RequestTerms {
-            asset: q.asset,
+            asset,
             max_principal: 2_500_000,
             allowed_verifiers: vec![verifier_key.clone()],
             max_bytes: 1_048_576,
-            expires_at: START + 3600,
+            expires_at: start + 3600,
         },
     )?;
     let quote = seller.quote(
@@ -118,8 +167,8 @@ pub fn run(scenario: &str, dir: &Path) -> AnyResult<Value> {
             verifier: verifier_key,
             receipt_issuer: issuer.public_hex(),
             policy: q.acceptance_policy,
-            deadlines: q.deadlines,
-            expires_at: START + 3600,
+            deadlines: deadlines.clone(),
+            expires_at: start + 3600,
             fees: q.fees,
             artifact_store: q.artifact_store,
         },
@@ -130,24 +179,63 @@ pub fn run(scenario: &str, dir: &Path) -> AnyResult<Value> {
         quote,
         acceptance,
     };
-    let fund = payer.prepare_fund(agreement.clone())?;
-    let order = &fund.review.order_id;
+    let review = Review::from_agreement(&agreement, &env)?;
+    let order = &review.order_id;
     let trust = ReceiptTrust {
         trusted_order: order.clone(),
         trusted_issuer: issuer.public_hex(),
         environment: env.clone(),
     };
-    session::write_trust(dir, &trust)?;
-    let sig = FundSignatures {
-        buyer: buyer.sign_fund(&fund)?,
-        seller: seller.sign_fund(&fund)?,
+    let balances = || -> AnyResult<[u64; 3]> {
+        let Some(v) = &validator else {
+            return Ok([opening, 0, 0]);
+        };
+        let (_, q) = agreement.terms(&env)?;
+        let Settlement::Solana {
+            buyer_token_account,
+            seller_token_account,
+            vault_token_account,
+            ..
+        } = &q.settlement
+        else {
+            return Err("missing token accounts".into());
+        };
+        Ok([
+            v.rpc.balance(buyer_token_account)?,
+            v.rpc.balance(seller_token_account)?,
+            v.rpc.balance(vault_token_account)?,
+        ])
     };
-    if payer.submit_fund(&fund, &sig)?.outcome != ChainOutcome::FinalizedSuccess {
+    let before = balances()?;
+    if let Some(v) = &validator {
+        let mut file = serde_json::to_value(&trust)?;
+        file["genesis"] = v.deployment.genesis.clone().into();
+        file["program_id"] = v.deployment.program_id.clone().into();
+        session::private_write(&dir.join("trust.json"), &serde_json::to_vec_pretty(&file)?)?;
+    } else {
+        session::write_trust(dir, &trust)?;
+    }
+    if buyer.fund(&seller, &agreement)?.outcome != ChainOutcome::FinalizedSuccess {
         return Err("funding pending".into());
     }
+    let wait = |target: &str| -> AnyResult<()> {
+        let target = settle463_core::ident::timestamp(target)?;
+        if let Some(v) = &validator {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            while v.rpc.clock()? < target {
+                if std::time::Instant::now() >= end {
+                    return Err("validator clock did not reach deadline".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+        } else {
+            payer.set_sim_clock(target, &token)?;
+        }
+        Ok(())
+    };
 
     if scenario == "no-delivery" {
-        payer.set_sim_clock(START + 7200, &token)?;
+        wait(&deadlines.deliver_by)?;
         buyer.refund_if_eligible(&agreement)?;
     } else {
         let bytes = if scenario == "bad-artifact" {
@@ -169,12 +257,7 @@ pub fn run(scenario: &str, dir: &Path) -> AnyResult<Value> {
             );
         }
         if scenario != "verifier-offline" {
-            let verifier = VerifierClient::connect(Arc::new(HttpCoordinator::new(
-                &server.base,
-                &env,
-                verifier_id,
-                Role::Verifier,
-            )?))?;
+            let verifier = VerifierClient::connect(connect(verifier_id, Role::Verifier)?)?;
             let verdict = verifier.judge(&agreement, &delivery)?;
             let Body::Verdict(v) = &verdict.unsigned().payload else {
                 return Err("unexpected verdict kind".into());
@@ -188,28 +271,41 @@ pub fn run(scenario: &str, dir: &Path) -> AnyResult<Value> {
             }
         }
         if scenario != "pass" {
-            payer.set_sim_clock(START + 10800, &token)?;
+            wait(&deadlines.resolve_by)?;
             buyer.refund_if_eligible(&agreement)?;
         }
     }
     let bytes = buyer.export_receipt(order)?;
-    let receipt = verify_sim_bundle(&bytes, &trust)?;
+    let receipt = if validator.is_some() {
+        verify_solana_bundle(&bytes, &trust)?.receipt
+    } else {
+        verify_sim_bundle(&bytes, &trust)?
+    };
     let path = dir.join("receipt.json");
     session::private_write(&path, &bytes)?;
-    let projection = payer.order(order)?;
-    let value = |k: &str| -> AnyResult<u64> {
-        Ok(decimal(projection[k].as_str().ok_or("missing balance")?)?)
+    let after = if validator.is_some() {
+        balances()?
+    } else {
+        let projection = payer.order(order)?;
+        let value = |k: &str| -> AnyResult<u64> {
+            Ok(decimal(projection[k].as_str().ok_or("missing balance")?)?)
+        };
+        [
+            value("buyer_balance")?,
+            value("seller_balance")?,
+            value("held")?,
+        ]
     };
-    let delta_buyer = i128::from(value("buyer_balance")?) - i128::from(opening);
+    let delta = |index: usize| (i128::from(after[index]) - i128::from(before[index])).to_string();
     Ok(json!({
         "order_id": order,
-        "backend": "sim",
+        "backend": if validator.is_some(){"local-validator"}else{"sim"},
         "outcome": receipt.outcome,
         "asset": receipt.asset.id,
         "principal": receipt.principal,
-        "delta_buyer": delta_buyer.to_string(),
-        "delta_seller": value("seller_balance")?.to_string(),
-        "delta_escrow": value("held")?.to_string(),
+        "delta_buyer": delta(0),
+        "delta_seller": delta(1),
+        "delta_escrow": delta(2),
         "receipt": path,
     }))
 }
