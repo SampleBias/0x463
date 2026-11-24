@@ -27,10 +27,13 @@ jobs:
           echo "$RUNNER_TEMP/solana-release/bin" >> "$GITHUB_PATH"
       - name: Build escrow for SBPF v3
         run: |
+          rustc --version
+          cargo --version
           anchor --version
           solana --version
           cargo-build-sbf --version
           cargo-build-sbf --tools-version v1.57 --arch v3 --manifest-path programs/settle463-escrow/Cargo.toml --sbf-out-dir "$RUNNER_TEMP/escrow" -- --locked
+          "$HOME/.cache/solana/v1.57/platform-tools/rust/bin/rustc" -Vv
           sha256sum "$RUNNER_TEMP/escrow/settle463_escrow.so"
       - name: Install native SQLite and the independent validator test driver
         run: |

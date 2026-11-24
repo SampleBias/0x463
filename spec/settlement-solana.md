@@ -185,6 +185,8 @@ Reject every other program id. Reject a system-program transfer of SOL to any de
 
 The fee payer signature is not a buyer, seller, or verifier signature unless that fee payer is actually that party.
 
+The local-validator signer creates legacy messages. Its fee policy allows a zero compute-unit price and a compute-unit limit of at most 1,400,000. The coordinator binds the blockhash context slot and expiry height to the exact message it prepared. Both funding parties review and sign again when a replacement message is required.
+
 ## Adapter reconciliation
 
 `FinalizedSuccess` applies to one action. Fetch its transaction by signature from the trusted RPC at finalized commitment and require transaction metadata with `meta.err == null`. For a submitted intent, match the locally stored signed transaction and its reviewed instruction list. For an independently submitted refund, identify the escrow instruction and attribute the transfer to its invocation of the classic SPL Token program. Check the expected action, arguments, signers, PDAs and accounts against the signed agreement. Read the program-owned escrow at finalized commitment with a context slot at least as recent as the transaction slot. Verify its immutable agreement IDs, parties, policy, mint, destinations, deadlines and principal.
@@ -199,6 +201,8 @@ The fee payer signature is not a buyer, seller, or verifier signature unless tha
 Measure transfer deltas in integer atomic units using the transaction's pre/post token balances for the expected account indices and mint. Vault dust can remain. A missing pre-balance counts as zero only for an ATA proven newly created and initialized empty in that transaction. Missing required evidence leaves the action unverified. A finalized account read can corroborate an earlier action after the order advances. Its balance is never a substitute for that transaction's deltas.
 
 `Pending` covers processed or confirmed attempts. A finalized transaction with an execution error is `FinalizedFailure`. `Expired` requires an expired blockhash and evidence that the attempt did not land. Missing history that leaves execution uncertain is `Unknown`. Only verified `release` or `refund` success permits a receipt, after also verifying the linked funding and any delivery. A restart that discovers a different party's eligible refund reconciles that refund under its own signature. It must preserve the original intent's actual outcome.
+
+An independent caller may submit a legacy or version-0 terminal transaction with a separate fee payer. Reconciliation authenticates the signatures over the original message. For version 0 it resolves the loaded writable and read-only addresses from finalized transaction metadata. It matches the specific escrow instruction and its inner token transfer, including when one transaction refunds several different orders. A missing earlier transaction leaves receipt issuance pending until its evidence is available.
 
 Inspect is a decoded `getAccount` of the escrow PDA plus the vault token balance. It is not an instruction.
 

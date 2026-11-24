@@ -1,4 +1,4 @@
-//! A persistent demo directory lets a later inspect process reopen the same simulator service.
+//! A persistent demo directory lets a fresh inspect process reopen the same coordinator.
 
 use crate::AnyResult;
 use settle463_core::{
