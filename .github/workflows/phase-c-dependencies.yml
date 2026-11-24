@@ -1,0 +1,44 @@
+name: Resolve Phase C dependencies
+on:
+  push:
+    paths: ['.github/workflows/phase-c-dependencies.yml']
+permissions:
+  contents: read
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Resolve on the workspace toolchain
+        run: |
+          cat >> apps/settle463d/Cargo.toml <<'DEPS'
+
+          [dependencies]
+          axum = "=0.8.8"
+          sqlx = {version="=0.8.6",default-features=false,features=["runtime-tokio","sqlite","migrate"]}
+          tokio = {version="1",features=["rt-multi-thread","macros","net","sync","fs","time"]}
+          serde = {version="1",features=["derive"]}
+          serde_json = "1"
+          ureq = {version="=2.12.1",default-features=false}
+          DEPS
+          cargo metadata --format-version 1 >/dev/null
+          python3 - <<'PY'
+          import base64,gzip,tarfile,io,json,tomllib,pathlib
+          lock=pathlib.Path("Cargo.lock")
+          names={p["name"]:[] for p in tomllib.loads(lock.read_text())["package"] if "source" in p}
+          for p in tomllib.loads(lock.read_text())["package"]:
+              if "source" in p: names[p["name"]].append(p["version"])
+          home=next((pathlib.Path.home()/".cargo/registry/index").glob("index.crates.io-*"))
+          index={}
+          for n,vs in names.items():
+              key = ("1/"+n if len(n)==1 else "2/"+n if len(n)==2 else "3/"+n[:1]+"/"+n if len(n)==3 else n[:2]+"/"+n[2:4]+"/"+n)
+              raw=(home/".cache"/key).read_bytes().split(b"\0")
+              vals=[json.loads(v) for v in raw if v.startswith(b"{") and json.loads(v)["vers"] in vs]
+              if len(vals)!=len(vs): raise ValueError(n)
+              index[key]=vals
+          payload=gzip.compress(json.dumps({"lock":lock.read_text(),"index":index},separators=(",",":")).encode())
+          encoded=base64.b64encode(payload).decode()
+          for i in range(0,len(encoded),2048):print("C_META",i,encoded[i:i+2048])
+          PY
