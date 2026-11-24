@@ -1,0 +1,22 @@
+{
+  "protocol": "0x463",
+  "version": "0.1",
+  "kind": "verdict",
+  "environment": "sim:fixture",
+  "issuer": "3de13e2c9ae53ae58635f9ef0e71444bb22c2b368031817a7fe4ceec779f0892",
+  "body": {
+    "order_id": "8ed07cfeafd6b86b5c1a4501912ec6f1984442f1247bd79aca2a2f166433b51c",
+    "quote_id": "897f47f4c14d7c93cb1ab3696b238af74c647a8cd59c0a35841a062069407003",
+    "delivery_id": "e16aaf1b7c9fb3296e8a6ed5b6d8644534fd5ffc7ef3b731b73892483090e4ff",
+    "policy_hash": "caadaf810c19a779b80c08c6493ec2ecfde3fb8f56f15baa449b7897db2a5f4b",
+    "algorithm": "sha256-json-object-v1",
+    "algorithm_version": "1",
+    "decision": "PASS",
+    "reason_codes": [
+      "MATCH"
+    ],
+    "observed_digest": "37ba5c2e570e4e256af7049d0d9c27f70b50f5de4210101d7c0bd2b497db7587",
+    "observed_length": "52"
+  },
+  "signature": "e5195e54f5eb3f4133a934b5d0762d98a0047ead32c0e2722ccb7a8ae92a4fac0f3d3055682d97cde433a2003571902ad83b7f2b547e24b8f750aa182fbb2005"
+}

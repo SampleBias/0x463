@@ -1,0 +1,20 @@
+{
+  "protocol": "0x463",
+  "version": "0.1",
+  "kind": "accept",
+  "environment": "sim:fixture",
+  "issuer": "565e92d8a9740879285d9ec5a4a088687e8fc6af9bc1382474be322a532e2bf1",
+  "body": {
+    "request_id": "02dc20c9d5f3f3bfaba6d91d97acd7ba10d25977988d2278a65468a7a74f1732",
+    "quote_id": "897f47f4c14d7c93cb1ab3696b238af74c647a8cd59c0a35841a062069407003",
+    "order_id": "8ed07cfeafd6b86b5c1a4501912ec6f1984442f1247bd79aca2a2f166433b51c",
+    "amount": "2000000",
+    "asset": {
+      "decimals": "6",
+      "id": "test-six-decimal",
+      "kind": "sim"
+    },
+    "environment": "sim:fixture"
+  },
+  "signature": "a66314b12be7470d1461411228a90f63aff690bf9c2a5156d1dc5493cdc294034a6e3090fa90c6f3702fec0c2f88b1628305f4ab50c7307945251ea13227bc02"
+}

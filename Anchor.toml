@@ -1,0 +1,17 @@
+[toolchain]
+anchor_version = "1.2.2"
+solana_version = "4.1.2"
+
+[programs.localnet]
+# Disposable WP-A0 program. Phase D supplies the escrow deployment ID.
+settle463_escrow = "GUUpc14gv8pcf9vzs9rTratT4nzGdymS2226vFqNReu4"
+
+[provider]
+cluster = "Localnet"
+wallet = "~/.config/solana/id.json"
+
+[test]
+startup_wait = 60000
+
+[test.validator]
+bind_address = "127.0.0.1"

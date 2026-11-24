@@ -1,0 +1,28 @@
+{
+  "protocol": "0x463",
+  "version": "0.2",
+  "kind": "service_offer",
+  "environment": "sim:fixture",
+  "issuer": "74025f58d197188cf5882237b7640627b8830b3c0ea4b0e03f4442eac1819043",
+  "body": {
+    "descriptor_version": "1",
+    "environments": [
+      "sim:fixture"
+    ],
+    "expires_at": "1700007200",
+    "input_profile": {
+      "content_type": "application/json",
+      "max_bytes": "1048576",
+      "schema_profile": "sha256-json-object-v1"
+    },
+    "output_profile": {
+      "content_type": "application/json",
+      "schema_profile": "sha256-json-object-v1"
+    },
+    "service_id": "sample-json-report",
+    "verification_profiles": [
+      "sha256-json-object-v1"
+    ]
+  },
+  "signature": "ee21a9c8cc0acddb0ac31d7cd3437f03ff08eacaf51a627f697f3db3d9f2d4bc8086598c1587ef2ca38330e54643288f0a872e4e0272db33977218075590ed0d"
+}

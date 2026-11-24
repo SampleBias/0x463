@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/settle463-core",
+    "crates/settle463-verify",
+    "crates/settle463-sim",
+    "crates/settle463-solana",
+    "crates/settle463-sdk",
+    "apps/settle463d",
+    "apps/settle463",
+    "programs/settle463-escrow",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false

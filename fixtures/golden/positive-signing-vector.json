@@ -1,0 +1,132 @@
+{
+  "description": "Independent positive vector. Produced by Python hashlib and cryptography, then checked with OpenSSL pkeyutl. Fixture keys only. Do not use as production identities.",
+  "generators": [
+    "python-hashlib",
+    "python-cryptography-ed25519",
+    "openssl-pkeyutl-3.6.5"
+  ],
+  "fixture_seed_domain": "0x463/fixture-seed/0.1",
+  "keys": {
+    "buyer": {
+      "seed_hex": "1e3f28441824566b8aae08b11d9341c893be3c6a023ac6e48ef241e5887c1240",
+      "public_key_hex": "565e92d8a9740879285d9ec5a4a088687e8fc6af9bc1382474be322a532e2bf1",
+      "public_key_base58": "6p9hoDpob59STuDkxVSdcM4dp9daCCenHXzsRqwRt3VS"
+    },
+    "seller": {
+      "seed_hex": "e3e6cb6df9fa284bdd69e157eefefb7651d0a5660ba3f68e441b7744546bcad6",
+      "public_key_hex": "74025f58d197188cf5882237b7640627b8830b3c0ea4b0e03f4442eac1819043",
+      "public_key_base58": "8orPgpKsoqwVUWHuhuxsQbpb3yZH3VBoCM1HuY5hxf7x"
+    },
+    "verifier": {
+      "seed_hex": "d4c40b766abd498d8fee93079203d76784445aed1fc550342ddbd462ae0f15aa",
+      "public_key_hex": "3de13e2c9ae53ae58635f9ef0e71444bb22c2b368031817a7fe4ceec779f0892",
+      "public_key_base58": "5AZ5NyY2rENAzDDCZsBAXdZnFYhdt5Xq2nZqfD6E7BwF"
+    },
+    "coordinator": {
+      "seed_hex": "4473508c14250eb07a211e2d6e05d8d628bd6190fe4b5431eb218c0571ae6d19",
+      "public_key_hex": "23fbe6e3f13af792e9ed982cfa5db5cba90019781f217ffd8642c13e3a10a91a",
+      "public_key_base58": "3RU44ThwM5uT1kxGAoc5ZjNmmuvo3p1kZtvjjuSXiXJZ"
+    }
+  },
+  "artifact": {
+    "utf8": "{\"job\":\"sample-001\",\"result\":\"complete\",\"units\":\"3\"}",
+    "length": "52",
+    "sha256": "37ba5c2e570e4e256af7049d0d9c27f70b50f5de4210101d7c0bd2b497db7587"
+  },
+  "order": {
+    "object": {
+      "environment": "sim:fixture",
+      "buyer": "565e92d8a9740879285d9ec5a4a088687e8fc6af9bc1382474be322a532e2bf1",
+      "nonce": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "canonical_utf8": "{\"buyer\":\"565e92d8a9740879285d9ec5a4a088687e8fc6af9bc1382474be322a532e2bf1\",\"environment\":\"sim:fixture\",\"nonce\":\"1111111111111111111111111111111111111111111111111111111111111111\"}",
+    "preimage_hex": "30783436332f6f726465722f302e31007b226275796572223a2235363565393264386139373430383739323835643965633561346130383836383765386663366166396263313338323437346265333232613533326532626631222c22656e7669726f6e6d656e74223a2273696d3a66697874757265222c226e6f6e6365223a2231313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131227d",
+    "order_id": "8ed07cfeafd6b86b5c1a4501912ec6f1984442f1247bd79aca2a2f166433b51c"
+  },
+  "policy": {
+    "object": {
+      "expected_digest": "37ba5c2e570e4e256af7049d0d9c27f70b50f5de4210101d7c0bd2b497db7587",
+      "expected_length": "52",
+      "limits": {
+        "max_bytes": "1048576",
+        "max_field_name_bytes": "64",
+        "max_fields": "64",
+        "max_string_bytes": "4096"
+      },
+      "profile": "sha256-json-object-v1",
+      "schema": {
+        "job": "string",
+        "result": "string",
+        "units": "u64_decimal"
+      }
+    },
+    "canonical_utf8": "{\"expected_digest\":\"37ba5c2e570e4e256af7049d0d9c27f70b50f5de4210101d7c0bd2b497db7587\",\"expected_length\":\"52\",\"limits\":{\"max_bytes\":\"1048576\",\"max_field_name_bytes\":\"64\",\"max_fields\":\"64\",\"max_string_bytes\":\"4096\"},\"profile\":\"sha256-json-object-v1\",\"schema\":{\"job\":\"string\",\"result\":\"string\",\"units\":\"u64_decimal\"}}",
+    "preimage_hex": "30783436332f706f6c6963792f302e31007b2265787065637465645f646967657374223a2233376261356332653537306534653235366166373034396430643963323766373062353066356465343231303130316437633062643262343937646237353837222c2265787065637465645f6c656e677468223a223532222c226c696d697473223a7b226d61785f6279746573223a2231303438353736222c226d61785f6669656c645f6e616d655f6279746573223a223634222c226d61785f6669656c6473223a223634222c226d61785f737472696e675f6279746573223a2234303936227d2c2270726f66696c65223a227368613235362d6a736f6e2d6f626a6563742d7631222c22736368656d61223a7b226a6f62223a22737472696e67222c22726573756c74223a22737472696e67222c22756e697473223a227536345f646563696d616c227d7d",
+    "policy_hash": "caadaf810c19a779b80c08c6493ec2ecfde3fb8f56f15baa449b7897db2a5f4b"
+  },
+  "signing": {
+    "unsigned_object": {
+      "protocol": "0x463",
+      "version": "0.1",
+      "kind": "service_offer",
+      "environment": "sim:fixture",
+      "issuer": "74025f58d197188cf5882237b7640627b8830b3c0ea4b0e03f4442eac1819043",
+      "body": {
+        "descriptor_version": "1",
+        "environments": [
+          "sim:fixture"
+        ],
+        "expires_at": "1700007200",
+        "input_profile": {
+          "content_type": "application/json",
+          "max_bytes": "1048576",
+          "schema_profile": "sha256-json-object-v1"
+        },
+        "output_profile": {
+          "content_type": "application/json",
+          "schema_profile": "sha256-json-object-v1"
+        },
+        "service_id": "sample-json-report",
+        "verification_profiles": [
+          "sha256-json-object-v1"
+        ]
+      }
+    },
+    "canonical_utf8": "{\"body\":{\"descriptor_version\":\"1\",\"environments\":[\"sim:fixture\"],\"expires_at\":\"1700007200\",\"input_profile\":{\"content_type\":\"application/json\",\"max_bytes\":\"1048576\",\"schema_profile\":\"sha256-json-object-v1\"},\"output_profile\":{\"content_type\":\"application/json\",\"schema_profile\":\"sha256-json-object-v1\"},\"service_id\":\"sample-json-report\",\"verification_profiles\":[\"sha256-json-object-v1\"]},\"environment\":\"sim:fixture\",\"issuer\":\"74025f58d197188cf5882237b7640627b8830b3c0ea4b0e03f4442eac1819043\",\"kind\":\"service_offer\",\"protocol\":\"0x463\",\"version\":\"0.1\"}",
+    "preimage_hex": "30783436332f7369676e65642f302e31007b22626f6479223a7b2264657363726970746f725f76657273696f6e223a2231222c22656e7669726f6e6d656e7473223a5b2273696d3a66697874757265225d2c22657870697265735f6174223a2231373030303037323030222c22696e7075745f70726f66696c65223a7b22636f6e74656e745f74797065223a226170706c69636174696f6e2f6a736f6e222c226d61785f6279746573223a2231303438353736222c22736368656d615f70726f66696c65223a227368613235362d6a736f6e2d6f626a6563742d7631227d2c226f75747075745f70726f66696c65223a7b22636f6e74656e745f74797065223a226170706c69636174696f6e2f6a736f6e222c22736368656d615f70726f66696c65223a227368613235362d6a736f6e2d6f626a6563742d7631227d2c22736572766963655f6964223a2273616d706c652d6a736f6e2d7265706f7274222c22766572696669636174696f6e5f70726f66696c6573223a5b227368613235362d6a736f6e2d6f626a6563742d7631225d7d2c22656e7669726f6e6d656e74223a2273696d3a66697874757265222c22697373756572223a2237343032356635386431393731383863663538383232333762373634303632376238383330623363306561346230653033663434343265616331383139303433222c226b696e64223a22736572766963655f6f66666572222c2270726f746f636f6c223a223078343633222c2276657273696f6e223a22302e31227d",
+    "signature_hex": "5b0f4278f648c20085738a94c175ce622b3110e3e9702f3b4b5b316d8741e1ab7a7de9eb2fc2f0d90f90d8a493c66d2f306c69f71ff93e07800b845e9f2f4c01",
+    "message_id": "ac78a7245326764d548f13907645c1ffcaf926da6a24292f4ca480e45d668004",
+    "signed_message": {
+      "protocol": "0x463",
+      "version": "0.1",
+      "kind": "service_offer",
+      "environment": "sim:fixture",
+      "issuer": "74025f58d197188cf5882237b7640627b8830b3c0ea4b0e03f4442eac1819043",
+      "body": {
+        "descriptor_version": "1",
+        "environments": [
+          "sim:fixture"
+        ],
+        "expires_at": "1700007200",
+        "input_profile": {
+          "content_type": "application/json",
+          "max_bytes": "1048576",
+          "schema_profile": "sha256-json-object-v1"
+        },
+        "output_profile": {
+          "content_type": "application/json",
+          "schema_profile": "sha256-json-object-v1"
+        },
+        "service_id": "sample-json-report",
+        "verification_profiles": [
+          "sha256-json-object-v1"
+        ]
+      },
+      "signature": "5b0f4278f648c20085738a94c175ce622b3110e3e9702f3b4b5b316d8741e1ab7a7de9eb2fc2f0d90f90d8a493c66d2f306c69f71ff93e07800b845e9f2f4c01"
+    }
+  },
+  "unicode_key_order": {
+    "description": "UTF-16 code-unit order places U+1F600 before U+E000. A UTF-8 byte sort reverses them.",
+    "canonical_utf8_hex": "7b22f09f9880223a226772696e222c22ee8080223a22707561227d"
+  }
+}

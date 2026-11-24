@@ -1,0 +1,32 @@
+{
+  "protocol": "0x463",
+  "version": "0.1",
+  "kind": "receipt",
+  "environment": "sim:fixture",
+  "issuer": "23fbe6e3f13af792e9ed982cfa5db5cba90019781f217ffd8642c13e3a10a91a",
+  "body": {
+    "order_id": "8ed07cfeafd6b86b5c1a4501912ec6f1984442f1247bd79aca2a2f166433b51c",
+    "outcome": "paid",
+    "asset": {
+      "decimals": "6",
+      "id": "test-six-decimal",
+      "kind": "sim"
+    },
+    "buyer": "565e92d8a9740879285d9ec5a4a088687e8fc6af9bc1382474be322a532e2bf1",
+    "seller": "74025f58d197188cf5882237b7640627b8830b3c0ea4b0e03f4442eac1819043",
+    "verifier": "3de13e2c9ae53ae58635f9ef0e71444bb22c2b368031817a7fe4ceec779f0892",
+    "receipt_issuer": "23fbe6e3f13af792e9ed982cfa5db5cba90019781f217ffd8642c13e3a10a91a",
+    "request_id": "02dc20c9d5f3f3bfaba6d91d97acd7ba10d25977988d2278a65468a7a74f1732",
+    "quote_id": "897f47f4c14d7c93cb1ab3696b238af74c647a8cd59c0a35841a062069407003",
+    "acceptance_id": "56f8fa53822285761b6f83865c0c1d91abd19ae86dc426880b6820c41807908f",
+    "environment": "sim:fixture",
+    "delivery_id": "e16aaf1b7c9fb3296e8a6ed5b6d8644534fd5ffc7ef3b731b73892483090e4ff",
+    "verdict_id": "436e93d42c6fa3e742623b1562c4edc4279a30736080408ce5bf4db2f435759b",
+    "destination": "sim:74025f58d197188cf5882237b7640627b8830b3c0ea4b0e03f4442eac1819043",
+    "ledger_kind": "sim",
+    "terminal_locator": "sim:8ed07cfeafd6b86b5c1a4501912ec6f1984442f1247bd79aca2a2f166433b51c:3",
+    "finality": "simulated-final",
+    "principal": "2000000"
+  },
+  "signature": "6e7462f52f71795f2bed44713106208e2c9d2c2932b48dfa90ae14be78c16ca7d4b897c3b3f47c98d5b651901cf364664cca2729df94702536ee9464e862a609"
+}

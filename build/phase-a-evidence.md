@@ -1,10 +1,28 @@
 # Phase A evidence
 
-2026-11-24 · WP-A0 **BLOCKED**. Git revision unavailable. The supplied directory contains the plan and has no readable Git HEAD.
+2026-11-24 · WP-A0 **PASS** on GitHub Actions, revision `b7416853a06c02cd7d22248db961f4926dcfd885`. The disposable validator initialized a new ledger. Program deployment and the separate client invocation both completed at finalized commitment. [Job and full logs](https://github.com/SampleBias/0x463/actions/runs/45425441171/job/138556028479)
 
-A one-instruction Anchor program and its client were generated under `/tmp`. Formatting passed. The build stopped during dependency resolution and the validator stopped during socket creation. Deployment and invocation remain pending. Phase A requires both before WP-A2. The workspace checks, Rust golden tests and subsequent phases remain pending.
+| Hosted check | Command or value | Exit |
+| --- | --- | ---: |
+| Generate and resolve | `bash scripts/phase-a0-spike.sh` called `anchor init`, `cargo fetch`, `npm install` and `cargo fmt --all --check` | 0 each |
+| Build | `anchor build --no-idl --tools-version v1.57 --arch v3 --provider.wallet "$wallet"` | 0 |
+| Deploy | `solana program deploy target/deploy/settle463_spike.so --program-id "$program_key" --output json` against loopback | 0 |
+| Invoke | `AnchorProvider.env().sendAndConfirm` with `commitment: "finalized"`, instruction `initialize` | 0 |
+| Genesis hash | `FxtQ4wnmBScLRzfYzvpikvuUoSwUJh1mso5pbWPXu2gM` | |
+| Program | `GUUpc14gv8pcf9vzs9rTratT4nzGdymS2226vFqNReu4` | |
+| Deployment signature | `va1JQxB1YHYTz7jJihQUSyCpwfTv8bWWw3r3JSQiL5273MQMUDqnK9ehEbdguT6k6d1r7Y1XhmMuuZeAfSbN6i7` | |
+| Invocation signature | `63Ko1gjfWcTujXVXh9cyuFJsJ2uMsXrqyZQEGeqHm7NjokDm54kfSCwgnvigWJrLeuNhvstidpxvS1CERuVH2rGW` | |
 
-## Toolchain and commands
+The project used host Rust/Cargo 1.89.0, Anchor 1.2.2, Solana CLI/validator 4.1.2, cargo-build-sbf 4.1.0, platform-tools v1.57 with Rust 1.95.0-dev and SBPF v3. The runner's default Rust 1.100.0 was superseded by the template's 1.89.0 pin. [Full configuration](../spec/toolchain.md)
+
+## Hosted spike attempts
+
+| Runner revision | Exact build | Outcome |
+| --- | --- | --- |
+| [ea36676](https://github.com/SampleBias/0x463/actions/runs/45418399739) | Anchor 0.32.1, Agave 2.3.0, bundled platform Cargo 1.84 | SBF compilation stopped on the edition-2024 manifest in `cpufeatures 0.3.1`. |
+| [34a1fd0](https://github.com/SampleBias/0x463/actions/runs/45419885532) | Anchor 1.2.2, Agave 4.1.2, platform-tools v1.57, SBPF v3 | The compiler reached `anchor-spl`. Its reduced feature set was missing the mandatory Solana SDK selection. The next run explicitly includes `solana-v3`, matching the `anchor-lang` default. |
+
+## Local toolchain and commands
 
 | Tool | Observed version |
 | --- | --- |
@@ -55,7 +73,7 @@ The installer targeted a side-by-side directory. In the following commands, `too
 2. **Ledger reconciliation.** The adapter checks funding, delivery, release and refund against the accounts, IDs and token movement for that action. Recovery accepts a later compatible escrow state as corroboration and requires the actual terminal transfer before issuing a receipt. T-REC-02 and T-VER-05 cover lost responses and missing history. [Solana contract](../spec/settlement-solana.md#adapter-reconciliation) · [Persistence contract](../spec/persistence.md#recovery-procedure)
 3. **Stable errors.** A new zero-principal fund returns 6008. A mismatch in a positive principal transfer returns 6003. T-SOL-07 checks 6008 and rollback. The numeric assignments match the original error table. [Error contract](../spec/settlement-solana.md#custom-errors) · [Conformance cases](../plan/03-conformance-matrix.md#solana-constraints)
 
-The independent Node check below verifies both JSON spellings against the regression bytes. Exit 0, output `7b22e280a8223a22e280a9227d`. The Rust conformance cases and validator scenarios await their implementation phases.
+The independent Node check below verifies both JSON spellings against the regression bytes. Exit 0, output `7b22e280a8223a22e280a9227d`. Rust conformance results are recorded below. The escrow-specific validator scenarios belong to Phase D.
 
 ```sh
 node <<'JS'
@@ -132,3 +150,101 @@ order_id 8ed07cfeafd6b86b5c1a4501912ec6f1984442f1247bd79aca2a2f166433b51c
 policy_hash caadaf810c19a779b80c08c6493ec2ecfde3fb8f56f15baa449b7897db2a5f4b
 6 artifact lengths and digests matched
 ```
+
+## Independent worked fixtures
+
+The worked payout uses the four published test identities, a 52-byte artifact and a terminal simulator clock of 1700001800. The bundle contains signed example data. No ledger transaction was submitted for this fixture.
+
+| Command | Exit | Result |
+| --- | ---: | --- |
+| `cmp plan/golden/positive-signing-vector.json fixtures/golden/positive-signing-vector.json` | 0 | Published copy matches the input byte for byte. |
+| `python3 fixtures/tools/independent_vector.py --write` | 0 | Generated the worked messages, bundle, ID index and ten negative cases. |
+| `python3 fixtures/tools/independent_vector.py` | 0 | Reproduced the golden IDs, verified the offer, and matched the stored example files. This command uses Python and Ed25519 through cryptography, independently of Rust. |
+| `python3 -O fixtures/tools/independent_vector.py` | 0 | The fixture checks also run with Python assertions disabled. |
+
+A second implementation checks the shipped bytes using Node's Ed25519 verifier and SHA-256. The command below verifies all seven signatures, derives the order and policy identifiers from their signed inputs, and follows the message references through the paid receipt. It checks the buyer, seller, verifier and receipt issuer against the original golden public keys.
+
+```sh
+node --input-type=module <<'JS'
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {createHash, createPublicKey, verify} from 'node:crypto';
+
+const dir = 'spec/examples/worked-transaction/';
+const read = file => JSON.parse(readFileSync(file, 'utf8'));
+const canonical = v => {
+  if (Array.isArray(v)) return '[' + v.map(canonical).join(',') + ']';
+  if (v && typeof v === 'object') {
+    return '{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + canonical(v[k])).join(',') + '}';
+  }
+  assert.ok(typeof v === 'string' || typeof v === 'boolean');
+  return JSON.stringify(v);
+};
+const input = (domain, obj) => Buffer.from('0x463/' + domain + '/0.1\0' + canonical(obj));
+const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+const golden = read('plan/golden/positive-signing-vector.json');
+const bundle = read(dir + 'bundle.json');
+const roles = {service_offer:'seller', request:'buyer', quote:'seller', accept:'buyer',
+              delivery:'seller', verdict:'verifier', receipt:'coordinator'};
+const ids = {}, bodies = {};
+for (const [kind, role] of Object.entries(roles)) {
+  const message = read(dir + kind + '.json');
+  const {signature, ...obj} = message;
+  assert.equal(obj.issuer, golden.keys[role].public_key_hex);
+  assert.deepEqual([obj.protocol,obj.version,obj.environment,obj.kind], ['0x463','0.1','sim:fixture',kind]);
+  const key = createPublicKey({format:'der', type:'spki',
+    key:Buffer.from('302a300506032b6570032100' + obj.issuer, 'hex')});
+  const data = input('signed',obj);
+  assert.ok(verify(null,data,key,Buffer.from(signature,'hex')),kind);
+  ids[kind] = hash(data);
+  bodies[kind] = obj.body;
+  assert.ok(readFileSync(dir+'README.md','utf8').includes(ids[kind]));
+  if (kind !== 'service_offer') assert.deepEqual(bundle[kind === 'accept' ? 'acceptance' : kind], message);
+}
+const {request:r, quote:q, accept:a, delivery:d, verdict:v, receipt:t} = bodies;
+const order = hash(input('order',{buyer:r.buyer, environment:bundle.environment, nonce:r.nonce}));
+const policy = hash(input('policy',q.acceptance_policy));
+for (const body of [r,q,a,d,v,t,bundle]) assert.equal(body.order_id,order);
+for (const body of [q,d,v]) assert.equal(body.policy_hash,policy);
+for (const body of [r,q]) assert.equal(body.offer_id,ids.service_offer);
+for (const body of [q,a,t]) assert.equal(body.request_id,ids.request);
+for (const body of [a,d,v,t]) assert.equal(body.quote_id,ids.quote);
+assert.equal(t.acceptance_id,ids.accept);
+for (const body of [v,t]) assert.equal(body.delivery_id,ids.delivery);
+assert.equal(t.verdict_id,ids.verdict);
+const artifact = readFileSync('fixtures/artifacts/reference.json');
+for (const digest of [d.digest,v.observed_digest,q.artifact.digest,q.acceptance_policy.expected_digest])
+  assert.equal(digest,hash(artifact));
+for (const length of [d.length,v.observed_length,q.artifact.length,q.acceptance_policy.expected_length])
+  assert.equal(length,String(artifact.length));
+assert.deepEqual([v.decision,v.reason_codes,t.outcome],['PASS',['MATCH'],'paid']);
+assert.equal(t.destination,'sim:'+golden.keys.seller.public_key_hex);
+assert.equal(t.principal,'2000000');
+for (const field of ['destination','principal','finality','ledger_kind','terminal_locator'])
+  assert.equal(bundle.ledger[field],t[field]);
+assert.ok(BigInt(bundle.ledger.clock) < BigInt(q.deadlines.resolve_by));
+console.log('7 signatures and linked IDs verified; receipt_id=' + ids.receipt);
+JS
+```
+
+Expected receipt ID is `22eb00b33ea53cb39763aa1907dc35bc47327d115f5e2c8d148fef447a5a627b`. The worked transaction index contains the remaining message IDs.
+
+## Phase A Rust workspace
+
+The root workspace contains the eight required members. Phase A implements wire processing in `settle463-core`. The other seven members compile as libraries and document their implementation phase. All eight participate in host checks. The escrow contract and its economic behavior start in Phase D.
+
+The following checks ran locally on host Rust/Cargo 1.89.0 on 2026-11-24. Cargo used `CARGO_HOME=/tmp/settle463-domain-cargo` and the committed lockfile. Two public crate archives missing locally were fetched on the [dependency runner](https://github.com/SampleBias/0x463/actions/runs/45427350037) and verified against the registry SHA-256 values in `Cargo.lock` before the offline build.
+
+| Command | Exit | Result |
+| --- | ---: | --- |
+| `cargo generate-lockfile --offline` | 0 | Registry dependencies resolved. |
+| `cargo fmt --all --check` | 0 | All eight members formatted. |
+| `cargo check --locked --offline --workspace` | 0 | All eight members compile. |
+| `cargo check --locked --offline -p settle463-core -p settle463-verify -p settle463-sim -p settle463-sdk` | 0 | Required domain crates compile. |
+| `cargo clippy --offline -p settle463-core --all-targets -- -D warnings` | 0 | Library and test targets pass. |
+| `cargo test --locked --offline -p settle463-core` | 0 | All eight integration tests pass. Covers T-GOLD-01–04, T-WIRE-01, all seven worked IDs, contextual amount rejection, positional JSON and missing verdict observations. |
+| `cmp plan/golden/positive-signing-vector.json fixtures/golden/positive-signing-vector.json` | 0 | Exact copy. |
+| `python3 fixtures/tools/independent_vector.py` | 0 | T-GOLD-05. Reproduced the original IDs and signature, seven worked messages, ten rejection fixtures and six raw artifacts. |
+| `cargo tree --locked --offline -p settle463-core -e normal` | 0 | The core has no Solana, Anchor, Tokio, Axum or SQLx dependency. |
+
+The Phase A [domain workflow](../.github/workflows/ci.yml) runs formatting, Clippy, locked Rust tests and the independent Python check on pushes and pull requests. Its run and commit can be located together in [the branch's run history](https://github.com/SampleBias/0x463/actions/workflows/ci.yml?query=branch%3Abuild%2Fphase-a-domain).

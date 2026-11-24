@@ -1,0 +1,13 @@
+version = "0.1"
+timeout_seconds = 300
+
+[[runtime]]
+name = "independent fixture regeneration and tamper check"
+argv = ["python3", "fixtures/tools/independent_vector.py"]
+expected_exit = 0
+stdout = """order_id=8ed07cfeafd6b86b5c1a4501912ec6f1984442f1247bd79aca2a2f166433b51c
+policy_hash=caadaf810c19a779b80c08c6493ec2ecfde3fb8f56f15baa449b7897db2a5f4b
+message_id=ac78a7245326764d548f13907645c1ffcaf926da6a24292f4ca480e45d668004
+worked_messages=7 negative_examples=10 receipt_id=22eb00b33ea53cb39763aa1907dc35bc47327d115f5e2c8d148fef447a5a627b
+"""
+stderr = ""

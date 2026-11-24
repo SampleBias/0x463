@@ -279,7 +279,7 @@ The chain stores this message id. One on-chain delivery per order.
 | `algorithm` | `sha256-json-object-v1` |
 | `algorithm_version` | `"1"` |
 | `decision` | `PASS`, `FAIL`, or `INDETERMINATE` |
-| `reason_codes` | Closed reason codes from the [verifier profile](../plan/00-locked-decisions.md#artifact-and-verifier-profile). |
+| `reason_codes` | Closed reason codes from the [verifier profile](verifier-sha256-json-object-v1.md#artifact-and-verifier-profile). |
 | `observed_digest` | Required when the bytes were obtained. Equals the raw SHA-256. |
 | `observed_length` | Required when the bytes were obtained. |
 
@@ -304,7 +304,7 @@ Required on every receipt:
 | `terminal_locator` | Simulator locator or Solana transaction signature. |
 | `finality` | `simulated-final` or `finalized` |
 
-Conditional fields follow the [receipt outcome table](../plan/00-locked-decisions.md#receipt-outcomes). `delivery_id` and `verdict_id` are omitted when that outcome does not include them. When a FAIL verdict is included on a timeout after delivery, `verdict_id` is that message id and the verdict decision is `FAIL`.
+Conditional fields follow the [receipt outcome table](receipts.md#receipt-outcomes). `delivery_id` and `verdict_id` are omitted when that outcome does not include them. When a FAIL verdict is included on a timeout after delivery, `verdict_id` is that message id and the verdict decision is `FAIL`.
 
 Simulator `terminal_locator` format: `sim:<order_id>:<decimal event seq>`.
 
@@ -358,4 +358,4 @@ Seller policy, checked before the seller signs a quote or a funding transaction:
 
 Verifier policy: sign a PASS verdict only after the local checks pass, and sign a release transaction only when it carries that verdict id, the stored delivery id, the quoted seller destination, and the exact principal.
 
-The supplied vector gives canonical bytes, signing preimages, signatures and derived IDs for the reference offer. [Positive signing vector](../plan/golden/positive-signing-vector.json)
+The supplied vector gives canonical bytes, signing preimages, signatures and derived IDs for the reference offer. [Positive signing vector](../fixtures/golden/positive-signing-vector.json)

@@ -1,0 +1,68 @@
+{
+  "protocol": "0x463",
+  "version": "0.1",
+  "kind": "quote",
+  "environment": "sim:fixture",
+  "issuer": "74025f58d197188cf5882237b7640627b8830b3c0ea4b0e03f4442eac1819043",
+  "body": {
+    "request_id": "02dc20c9d5f3f3bfaba6d91d97acd7ba10d25977988d2278a65468a7a74f1732",
+    "order_id": "8ed07cfeafd6b86b5c1a4501912ec6f1984442f1247bd79aca2a2f166433b51c",
+    "offer_id": "ac78a7245326764d548f13907645c1ffcaf926da6a24292f4ca480e45d668004",
+    "buyer": "565e92d8a9740879285d9ec5a4a088687e8fc6af9bc1382474be322a532e2bf1",
+    "seller": "74025f58d197188cf5882237b7640627b8830b3c0ea4b0e03f4442eac1819043",
+    "verifier": "3de13e2c9ae53ae58635f9ef0e71444bb22c2b368031817a7fe4ceec779f0892",
+    "receipt_issuer": "23fbe6e3f13af792e9ed982cfa5db5cba90019781f217ffd8642c13e3a10a91a",
+    "service_id": "sample-json-report",
+    "artifact": {
+      "digest": "37ba5c2e570e4e256af7049d0d9c27f70b50f5de4210101d7c0bd2b497db7587",
+      "length": "52",
+      "verification_profile": "sha256-json-object-v1",
+      "max_bytes": "1048576"
+    },
+    "acceptance_policy": {
+      "expected_digest": "37ba5c2e570e4e256af7049d0d9c27f70b50f5de4210101d7c0bd2b497db7587",
+      "expected_length": "52",
+      "limits": {
+        "max_bytes": "1048576",
+        "max_field_name_bytes": "64",
+        "max_fields": "64",
+        "max_string_bytes": "4096"
+      },
+      "profile": "sha256-json-object-v1",
+      "schema": {
+        "job": "string",
+        "result": "string",
+        "units": "u64_decimal"
+      }
+    },
+    "policy_hash": "caadaf810c19a779b80c08c6493ec2ecfde3fb8f56f15baa449b7897db2a5f4b",
+    "amount": "2000000",
+    "asset": {
+      "decimals": "6",
+      "id": "test-six-decimal",
+      "kind": "sim"
+    },
+    "settlement": {
+      "asset_id": "test-six-decimal",
+      "buyer_destination": "sim:565e92d8a9740879285d9ec5a4a088687e8fc6af9bc1382474be322a532e2bf1",
+      "profile": "sim-ledger-v1",
+      "seller_destination": "sim:74025f58d197188cf5882237b7640627b8830b3c0ea4b0e03f4442eac1819043"
+    },
+    "deadlines": {
+      "fund_by": "1700003600",
+      "deliver_by": "1700003600",
+      "resolve_by": "1700010800"
+    },
+    "expires_at": "1700003600",
+    "fees": {
+      "protocol_atomic": "0",
+      "network_fee_payer": "buyer"
+    },
+    "artifact_store": {
+      "store_id": "fixture-store",
+      "read_access": "order-parties",
+      "retention_seconds": "86400"
+    }
+  },
+  "signature": "720b893c75cc41a15a9929baf84be2b3cf548547987c0b7650b6b04ce51d646be40c0bdaf96dfe0ca2ee1cdc033417c213c654bffc2ce0a1fba43e45cbd7bb04"
+}

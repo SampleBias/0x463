@@ -1,0 +1,30 @@
+{
+  "protocol": "0x463",
+  "version": "0.1",
+  "kind": "request",
+  "environment": "sim:fixture",
+  "issuer": "565e92d8a9740879285d9ec5a4a088687e8fc6af9bc1382474be322a532e2bf1",
+  "body": {
+    "order_id": "8ed07cfeafd6b86b5c1a4501912ec6f1984442f1247bd79aca2a2f166433b51c",
+    "nonce": "1111111111111111111111111111111111111111111111111111111111111111",
+    "service_id": "sample-json-report",
+    "offer_id": "ac78a7245326764d548f13907645c1ffcaf926da6a24292f4ca480e45d668004",
+    "buyer": "565e92d8a9740879285d9ec5a4a088687e8fc6af9bc1382474be322a532e2bf1",
+    "seller": "74025f58d197188cf5882237b7640627b8830b3c0ea4b0e03f4442eac1819043",
+    "artifact_constraints": {
+      "verification_profile": "sha256-json-object-v1",
+      "max_bytes": "1048576"
+    },
+    "allowed_verifiers": [
+      "3de13e2c9ae53ae58635f9ef0e71444bb22c2b368031817a7fe4ceec779f0892"
+    ],
+    "asset": {
+      "decimals": "6",
+      "id": "test-six-decimal",
+      "kind": "sim"
+    },
+    "max_principal": "2500000",
+    "expires_at": "1700003600"
+  },
+  "signature": "45f3a835b7e1fd042e5368cb7c1881521ff1be6dcbbed28d2c8b1a22073254c93644920e8300267450c26961ba95553b7a05068151cac90f1665629006887f06"
+}
