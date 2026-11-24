@@ -267,6 +267,8 @@ pub struct Resolution {
     pub outcome: ChainOutcome,
     pub slot: Option<u64>,
     pub clock: Option<i64>,
+    /// Verified terminal state for an AlreadyComplete replay whose own transaction failed.
+    pub known_terminal: Option<settle463_core::settlement::OrderState>,
 }
 impl Resolution {
     fn status(outcome: ChainOutcome) -> Self {
@@ -274,6 +276,7 @@ impl Resolution {
             outcome,
             slot: None,
             clock: None,
+            known_terminal: None,
         }
     }
 }

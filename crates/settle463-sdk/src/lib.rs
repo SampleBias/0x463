@@ -32,6 +32,8 @@ pub enum Error {
     Environment,
     #[error("LINKAGE_FAILED")]
     Linkage,
+    #[error("order already settled as {0:?}")]
+    AlreadyComplete(settle463_core::settlement::OrderState),
     #[error("HTTP {status}: {code}")]
     Http { status: u16, code: String },
     #[error(transparent)]

@@ -316,7 +316,7 @@ fn allocate_escrow<'info>(
 pub struct InitializeConfig<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
-    #[account(init, payer=authority, space=8+Config::INIT_SPACE, seeds=[b"settle463", b"config", b"v1"], bump)]
+    #[account(init, payer=authority, space=8+Config::INIT_SPACE, seeds=[b"settle463".as_slice(), b"config".as_slice(), b"v1".as_slice()], bump)]
     pub config: Account<'info, Config>,
     pub program_data: Account<'info, ProgramData>,
     /// CHECK: Classic token ownership, initialized mint data and decimals are checked in the handler.
@@ -332,10 +332,10 @@ pub struct Fund<'info> {
     #[account(mut)]
     pub buyer: Signer<'info>,
     pub seller: Signer<'info>,
-    #[account(seeds=[b"settle463", b"config", b"v1"], bump=config.bump)]
+    #[account(seeds=[b"settle463".as_slice(), b"config".as_slice(), b"v1".as_slice()], bump=config.bump)]
     pub config: Account<'info, Config>,
     /// CHECK: Canonical PDA, checked for replay before atomic allocation and serialization.
-    #[account(mut, seeds=[b"settle463", b"escrow", b"v1", buyer.key().as_ref(), &args.request_nonce], bump)]
+    #[account(mut, seeds=[b"settle463".as_slice(), b"escrow".as_slice(), b"v1".as_slice(), buyer.key().as_ref(), &args.request_nonce], bump)]
     pub escrow: UncheckedAccount<'info>,
     /// CHECK: Matched to the config and decoded as an initialized six-decimal classic mint.
     pub mint: UncheckedAccount<'info>,

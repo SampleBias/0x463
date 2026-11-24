@@ -414,7 +414,7 @@ pub(crate) async fn recover(s: &State) -> Result<()> {
         }
     }
     if let Some(chain) = &s.chain {
-        if let Err(e) = chain.discover_refunds(s).await {
+        if let Err(e) = chain.discover_terminals(s).await {
             if e.1 != "LEDGER_UNAVAILABLE" {
                 return Err(e);
             }
@@ -423,16 +423,21 @@ pub(crate) async fn recover(s: &State) -> Result<()> {
     Ok(())
 }
 pub(crate) async fn status(db: &mut Conn, order: &str, id: &str) -> Result<Vec<u8>> {
-    let state: Option<String> =
-        sqlx::query_scalar("SELECT state FROM intents WHERE intent_id=? AND order_id=?")
+    let row: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT state,known_terminal FROM intents WHERE intent_id=? AND order_id=?")
             .bind(id)
             .bind(order)
             .fetch_optional(db)
             .await?;
-    let outcome = match state.as_deref() {
+    let outcome = match row.as_ref().map(|r| r.0.as_str()) {
         Some("prepared" | "submitted") => "pending",
+        Some("observed") => "unknown",
         Some(outcome) => outcome,
         None => "unknown",
     };
-    json_bytes(json!({"intent_id":id,"outcome":outcome}))
+    let mut response = json!({"intent_id":id,"outcome":outcome});
+    if let Some((_, Some(state))) = &row {
+        response["known_terminal"] = state.clone().into();
+    }
+    json_bytes(response)
 }

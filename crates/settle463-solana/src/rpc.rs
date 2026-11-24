@@ -44,6 +44,39 @@ pub(crate) struct Account {
     pub data: Vec<u8>,
     pub executable: bool,
 }
+fn account_value(result: &Value, minimum: u64) -> Result<&Value> {
+    ensure(
+        result["context"]["slot"]
+            .as_u64()
+            .is_some_and(|slot| slot >= minimum),
+        "stale account context",
+    )?;
+    result
+        .get("value")
+        .ok_or_else(|| invalid("missing account response"))
+}
+fn decode_account(v: &Value) -> Result<Option<Account>> {
+    if v.is_null() {
+        return Ok(None);
+    }
+    ensure(v["data"][1] == "base64", "account encoding")?;
+    Ok(Some(Account {
+        data: STANDARD
+            .decode(
+                v["data"][0]
+                    .as_str()
+                    .ok_or_else(|| invalid("account data"))?,
+            )
+            .map_err(invalid)?,
+        owner: v["owner"]
+            .as_str()
+            .ok_or_else(|| invalid("account owner"))?
+            .to_owned(),
+        executable: v["executable"]
+            .as_bool()
+            .ok_or_else(|| invalid("account executable flag"))?,
+    }))
+}
 #[derive(Clone)]
 pub struct Rpc {
     pub(crate) deployment: Deployment,
@@ -83,35 +116,21 @@ impl Rpc {
     }
     pub(crate) fn account(&self, address: &str, minimum: u64) -> Result<Option<Account>> {
         let result=self.call("getAccountInfo",json!([address,{"encoding":"base64","commitment":"finalized","minContextSlot":minimum}]))?;
-        ensure(
-            result["context"]["slot"]
-                .as_u64()
-                .is_some_and(|slot| slot >= minimum),
-            "stale account context",
+        decode_account(account_value(&result, minimum)?)
+    }
+    pub(crate) fn escrow_and_vault(
+        &self,
+        e: &Expected,
+    ) -> Result<(Option<Account>, Option<Account>)> {
+        let response = self.call(
+            "getMultipleAccounts",
+            json!([[e.terms.escrow_account, e.vault.to_string()], {"encoding":"base64", "commitment":"finalized"}]),
         )?;
-        let v = result
-            .get("value")
-            .ok_or_else(|| invalid("missing account response"))?;
-        if v.is_null() {
-            return Ok(None);
-        }
-        ensure(v["data"][1] == "base64", "account encoding")?;
-        Ok(Some(Account {
-            data: STANDARD
-                .decode(
-                    v["data"][0]
-                        .as_str()
-                        .ok_or_else(|| invalid("account data"))?,
-                )
-                .map_err(invalid)?,
-            owner: v["owner"]
-                .as_str()
-                .ok_or_else(|| invalid("account owner"))?
-                .to_owned(),
-            executable: v["executable"]
-                .as_bool()
-                .ok_or_else(|| invalid("account executable flag"))?,
-        }))
+        let accounts = account_value(&response, 0)?
+            .as_array()
+            .filter(|a| a.len() == 2)
+            .ok_or_else(|| invalid("expected escrow and vault accounts"))?;
+        Ok((decode_account(&accounts[0])?, decode_account(&accounts[1])?))
     }
     fn check_runtime(&self) -> Result<()> {
         let d = &self.deployment;
@@ -180,19 +199,13 @@ impl Rpc {
         ))
     }
     pub fn balance(&self, ata: &str) -> Result<u64> {
-        self.token_balance(ata, None, 0)
-            .map(|b| b.unwrap_or_default())
+        key(ata)?;
+        self.account(ata, 0)?
+            .map(|a| self.token_balance(&a, None))
+            .transpose()
+            .map(Option::unwrap_or_default)
     }
-    pub(crate) fn token_balance(
-        &self,
-        address: &str,
-        owner: Option<&Pubkey>,
-        slot: u64,
-    ) -> Result<Option<u64>> {
-        key(address)?;
-        let Some(a) = self.account(address, slot)? else {
-            return Ok(None);
-        };
+    pub(crate) fn token_balance(&self, a: &Account, owner: Option<&Pubkey>) -> Result<u64> {
         ensure(
             a.owner == TOKEN_PROGRAM
                 && !a.executable
@@ -202,9 +215,9 @@ impl Rpc {
                 && owner.is_none_or(|k| k.as_ref() == &a.data[32..64]),
             "token account program, mint or authority",
         )?;
-        Ok(Some(u64::from_le_bytes(
+        Ok(u64::from_le_bytes(
             a.data[64..72].try_into().map_err(invalid)?,
-        )))
+        ))
     }
     fn latest(&self) -> Result<(String, u64, u64)> {
         let v = self.call("getLatestBlockhash", json!([{"commitment":"finalized"}]))?;
@@ -227,7 +240,6 @@ impl Rpc {
             e.deployment == self.deployment,
             "different signing deployment",
         )?;
-        self.validate_deployment()?;
         let now = self.clock()?;
         let [fund, deliver, resolve] = e.times()?;
         let view = self.inspect(e)?;
@@ -320,8 +332,15 @@ impl Rpc {
     }
     pub fn find_refund(&self, e: &Expected) -> Result<Option<(String, Resolution)>> {
         ensure(
-            e.action == ChainAction::Refund && e.payer.is_none(),
+            e.action == ChainAction::Refund,
             "external refund search context",
+        )?;
+        self.find_terminal(e)
+    }
+    pub fn find_terminal(&self, e: &Expected) -> Result<Option<(String, Resolution)>> {
+        ensure(
+            matches!(e.action, ChainAction::Refund | ChainAction::Release) && e.payer.is_none(),
+            "verified terminal search context",
         )?;
         self.validate_deployment()?;
         let mut before = None::<String>;

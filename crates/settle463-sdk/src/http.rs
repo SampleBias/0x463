@@ -368,6 +368,17 @@ impl HttpCoordinator {
     }
 }
 fn outcome(v: &Value) -> Result<ChainOutcome> {
+    if let Some(state) = v.get("known_terminal") {
+        use settle463_core::settlement::OrderState;
+        if text(v, "outcome")? != "finalized_failure" {
+            return Err(Error::Linkage);
+        }
+        return Err(Error::AlreadyComplete(match state.as_str() {
+            Some("Paid") => OrderState::Paid,
+            Some("Refunded") => OrderState::Refunded,
+            _ => return Err(Error::Linkage),
+        }));
+    }
     Ok(match text(v, "outcome")? {
         "finalized_success" => ChainOutcome::FinalizedSuccess,
         "finalized_failure" => ChainOutcome::FinalizedFailure,
@@ -612,6 +623,22 @@ impl SettlementBackend for HttpCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_replay_reports_the_settled_order_without_attributing_success_to_the_replay() {
+        use settle463_core::settlement::OrderState;
+        for (label, expected) in [
+            ("Paid", OrderState::Paid),
+            ("Refunded", OrderState::Refunded),
+        ] {
+            let replay = json!({"outcome":"finalized_failure","known_terminal":label});
+            assert!(
+                matches!(outcome(&replay), Err(Error::AlreadyComplete(state)) if state == expected)
+            );
+        }
+        let inconsistent = json!({"outcome":"finalized_success","known_terminal":"Paid"});
+        assert!(matches!(outcome(&inconsistent), Err(Error::Linkage)));
+    }
 
     #[test]
     fn embedded_envelopes_reject_duplicate_keys_before_map_deserialization() {

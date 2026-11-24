@@ -383,23 +383,25 @@ impl Rpc {
         let Some(a) = self.account(&e.terms.escrow_account, slot)? else {
             return Ok(None);
         };
+        self.decode_owned_escrow(e, &a).map(Some)
+    }
+    fn decode_owned_escrow(&self, e: &Expected, a: &crate::rpc::Account) -> Result<OrderView> {
         ensure(
             !a.executable && a.owner == self.deployment.program_id,
             "escrow owner",
         )?;
-        Ok(Some(e.decode_escrow(&a.data)?))
+        e.decode_escrow(&a.data)
     }
     pub fn inspect(&self, e: &Expected) -> Result<Option<OrderView>> {
-        let Some(v) = self.escrow_at(e, 0)? else {
+        ensure(self.deployment == e.deployment, "RPC deployment")?;
+        self.validate_deployment()?;
+        let (escrow, vault) = self.escrow_and_vault(e)?;
+        let Some(escrow) = escrow else {
             return Ok(None);
         };
-        let balance = self
-            .token_balance(
-                &e.vault.to_string(),
-                Some(&key(&e.terms.escrow_account)?),
-                0,
-            )?
-            .ok_or_else(|| invalid("missing escrow vault"))?;
+        let v = self.decode_owned_escrow(e, &escrow)?;
+        let vault = vault.ok_or_else(|| invalid("missing escrow vault"))?;
+        let balance = self.token_balance(&vault, Some(&key(&e.terms.escrow_account)?))?;
         ensure(balance >= v.held, "vault balance below held principal")?;
         Ok(Some(v))
     }
@@ -442,10 +444,20 @@ impl Rpc {
         };
         let clock = v["blockTime"].as_i64();
         if !err.is_null() {
+            let mut known_terminal = None;
+            if err["InstructionError"][0].as_u64() == Some(at as u64)
+                && err["InstructionError"][1]["Custom"] == 6006
+            {
+                known_terminal = self
+                    .escrow_at(e, slot)?
+                    .map(|v| v.state)
+                    .filter(|s| matches!(s, OrderState::Paid | OrderState::Refunded));
+            }
             return Ok(Resolution {
                 outcome: ChainOutcome::FinalizedFailure,
                 slot: Some(slot),
                 clock,
+                known_terminal,
             });
         }
         transfer_evidence(e, &msg, &v["meta"], at)?;
@@ -457,7 +469,49 @@ impl Rpc {
             outcome: ChainOutcome::FinalizedSuccess,
             slot: Some(slot),
             clock,
+            known_terminal: None,
         })
+    }
+    /// A null transaction lookup alone cannot rule out a gap in RPC history. Follow
+    /// finalized parent links to the block that supplied the signed recent blockhash.
+    fn proved_absent(
+        &self,
+        signature: &str,
+        hash: &str,
+        mut slot: u64,
+        context: u64,
+    ) -> Result<bool> {
+        if slot < context || slot - context > 1024 {
+            return Ok(false);
+        }
+        let mut required_hash = None;
+        for _ in 0..=1024 {
+            let block=self.call("getBlock",json!([slot,{"commitment":"finalized","transactionDetails":"signatures","rewards":false,"maxSupportedTransactionVersion":0}]))?;
+            let (Some(block_hash), Some(previous), Some(parent), Some(signatures)) = (
+                block["blockhash"].as_str(),
+                block["previousBlockhash"].as_str(),
+                block["parentSlot"].as_u64(),
+                block["signatures"].as_array(),
+            ) else {
+                return Ok(false);
+            };
+            if required_hash.as_deref().is_some_and(|h| h != block_hash)
+                || signatures
+                    .iter()
+                    .any(|s| s.as_str().is_none_or(|s| s == signature))
+            {
+                return Ok(false);
+            }
+            if block_hash == hash {
+                return Ok(slot <= context);
+            }
+            if slot == 0 || parent >= slot || slot < context {
+                return Ok(false);
+            }
+            required_hash = Some(previous.to_owned());
+            slot = parent;
+        }
+        Ok(false)
     }
     fn missing(&self, e: &Expected, sig: &str, stored: Option<&SignedTx>) -> Result<Resolution> {
         let s = self.call(
@@ -511,6 +565,17 @@ impl Rpc {
                     Some(OrderState::Funded | OrderState::Delivered)
                 )
         );
+        let tip = valid["context"]["slot"].as_u64();
+        let absent = if let Some(slot) = tip.filter(|_| absent) {
+            self.proved_absent(
+                sig,
+                &msg.recent_blockhash.to_string(),
+                slot,
+                tx.context_slot,
+            )?
+        } else {
+            false
+        };
         Ok(Resolution::status(if absent {
             ChainOutcome::Expired
         } else {

@@ -149,9 +149,11 @@ impl Chain {
         let (action, inputs) = inputs(s, db, order, v, false).await?;
         let expected = inputs.expected(self, action, false)?;
         let draft = chain_call(|| self.rpc.prepare(&expected))?;
-        json_bytes(
-            json!({"context_slot":draft.context_slot.to_string(),"message":draft.message,"last_valid_block_height":draft.last_valid_block_height.to_string()}),
-        )
+        json_bytes(json!({
+            "context_slot": draft.context_slot.to_string(),
+            "message": draft.message,
+            "last_valid_block_height": draft.last_valid_block_height.to_string(),
+        }))
     }
     pub(super) async fn enqueue(
         &self,
@@ -197,8 +199,24 @@ impl Chain {
             .map_err(|_| ApiError::auth())?;
         let delivery = inputs.delivery.as_ref().map(|m| hex_string(m.id()));
         let verdict = inputs.verdict.as_ref().map(|m| hex_string(m.id()));
-        let rows=sqlx::query("INSERT OR IGNORE INTO intents(intent_id,order_id,action,state,signed_bytes,local_signature,last_valid_block_height,context_slot,delivery_message,verdict_message) VALUES(?,?,?,'prepared',?,?,?,?,?,?)")
-            .bind(&id).bind(order).bind(name).bind(raw).bind(&signed.signature).bind(signed.last_valid_block_height.to_string()).bind(signed.context_slot.to_string()).bind(delivery).bind(verdict).execute(&mut *db).await?.rows_affected();
+        let rows = sqlx::query(
+            "INSERT OR IGNORE INTO intents(
+                intent_id,order_id,action,state,signed_bytes,local_signature,
+                last_valid_block_height,context_slot,delivery_message,verdict_message
+            ) VALUES(?,?,?,'prepared',?,?,?,?,?,?)",
+        )
+        .bind(&id)
+        .bind(order)
+        .bind(name)
+        .bind(raw)
+        .bind(&signed.signature)
+        .bind(signed.last_valid_block_height.to_string())
+        .bind(signed.context_slot.to_string())
+        .bind(delivery)
+        .bind(verdict)
+        .execute(&mut *db)
+        .await?
+        .rows_affected();
         if rows != 1 {
             return Err(ApiError::conflict("STATE_CONFLICT"));
         }
@@ -257,8 +275,25 @@ impl Chain {
             Err(error) => return Err(error),
         };
         if resolution.outcome == ChainOutcome::FinalizedSuccess {
-            self.finalize(s, &mut db, &row, &inputs, kind, &resolution)
+            if let Err(error) = self
+                .finalize(s, &mut db, &row, &inputs, kind, &resolution)
+                .await
+            {
+                if error.1 != "LEDGER_UNAVAILABLE" {
+                    return Err(error);
+                }
+                db.rollback().await?;
+                let mut audit = s.pool.begin_with("BEGIN IMMEDIATE").await?;
+                gap(
+                    s,
+                    &mut audit,
+                    &order,
+                    "missing preceding finalized transaction",
+                )
                 .await?;
+                audit.commit().await?;
+                return Err(error);
+            }
         } else if matches!(
             resolution.outcome,
             ChainOutcome::Expired | ChainOutcome::FinalizedFailure
@@ -268,14 +303,31 @@ impl Chain {
             } else {
                 "finalized_failure"
             };
-            sqlx::query("UPDATE intents SET state=?,finalized_slot=? WHERE intent_id=?")
-                .bind(terminal)
-                .bind(resolution.slot.map(|n| n.to_string()))
-                .bind(id)
-                .execute(&mut *db)
-                .await?;
+            sqlx::query(
+                "UPDATE intents SET state=?,finalized_slot=?,known_terminal=? WHERE intent_id=?",
+            )
+            .bind(terminal)
+            .bind(resolution.slot.map(|n| n.to_string()))
+            .bind(resolution.known_terminal.map(|state| format!("{state:?}")))
+            .bind(id)
+            .execute(&mut *db)
+            .await?;
         } else {
             // The signed bytes are durable before this call. Retransmission uses the same signature.
+            if chain_call(|| self.rpc.inspect(&expected))?
+                .is_some_and(|v| matches!(v.state, OrderState::Paid | OrderState::Refunded))
+            {
+                gap(
+                    s,
+                    &mut db,
+                    &order,
+                    "terminal escrow observed while submitted signature is unproven",
+                )
+                .await?;
+                retry(&mut db, &row, "unknown", Some("RECONCILIATION_GAP")).await?;
+                db.commit().await?;
+                return Ok(());
+            }
             let sent = chain_call(|| self.rpc.broadcast(&signed)).is_ok();
             #[cfg(debug_assertions)]
             if sent
@@ -284,11 +336,12 @@ impl Chain {
             {
                 std::process::exit(87);
             }
-            let status = if sent || resolution.outcome == ChainOutcome::Pending {
-                "submitted"
-            } else {
-                "unknown"
-            };
+            let status =
+                if resolution.outcome == ChainOutcome::Pending || (sent && state == "prepared") {
+                    "submitted"
+                } else {
+                    "unknown"
+                };
             retry(
                 &mut db,
                 &row,
@@ -323,7 +376,6 @@ impl Chain {
     ) -> Result<()> {
         let signature: &str = row.get("local_signature");
         let slot = res.slot.ok_or_else(ApiError::link)?;
-        let clock = res.clock.ok_or_else(ApiError::link)?;
         let review = Review::from_agreement(&e.agreement, &s.config.environment)?;
         let amount = decimal(&review.principal)?;
         let (state, held, paid, refunded) = match kind {
@@ -342,7 +394,7 @@ impl Chain {
             delivery_id: e.delivery.as_ref().map(|d| hex_string(d.id())),
             verdict_id: e.verdict.as_ref().map(|v| hex_string(v.id())),
             terminal_locator: terminal.then(|| signature.to_owned()),
-            terminal_clock: terminal.then_some(clock),
+            terminal_clock: if terminal { res.clock } else { None },
         };
         let ledger = if terminal {
             Some(self.ledger(s, db, e, &view, slot).await?)
@@ -361,15 +413,38 @@ impl Chain {
             .bind(order)
             .fetch_one(&mut *db)
             .await?;
-        let n=sqlx::query("UPDATE orders SET state=?,held=?,paid=?,refunded=?,delivery_id=?,verdict_id=?,terminal_clock=?,terminal_locator=?,version=version+1
-                            WHERE order_id=? AND state=? AND version=?").bind(format!("{state:?}")).bind(held.to_string()).bind(paid.to_string()).bind(refunded.to_string())
-            .bind(&view.delivery_id).bind(&view.verdict_id).bind(view.terminal_clock.map(|v|v.to_string())).bind(&view.terminal_locator)
-            .bind(order).bind(old).bind(version).execute(&mut *db).await?.rows_affected();
+        let n = sqlx::query(
+            "UPDATE orders SET state=?,held=?,paid=?,refunded=?,delivery_id=?,verdict_id=?,
+             terminal_clock=?,terminal_locator=?,version=version+1
+             WHERE order_id=? AND state=? AND version=?",
+        )
+        .bind(format!("{state:?}"))
+        .bind(held.to_string())
+        .bind(paid.to_string())
+        .bind(refunded.to_string())
+        .bind(&view.delivery_id)
+        .bind(&view.verdict_id)
+        .bind(view.terminal_clock.map(|v| v.to_string()))
+        .bind(&view.terminal_locator)
+        .bind(order)
+        .bind(old)
+        .bind(version)
+        .execute(&mut *db)
+        .await?
+        .rows_affected();
         if n != 1 {
             return Err(ApiError::conflict("STATE_CONFLICT"));
         }
         let id: &str = row.get("intent_id");
-        sqlx::query("UPDATE intents SET state='finalized_success', finalized_slot=?, execution_clock=? WHERE intent_id=?").bind(slot.to_string()).bind(clock.to_string()).bind(id).execute(&mut *db).await?;
+        sqlx::query(
+            "UPDATE intents SET state='finalized_success',finalized_slot=?,execution_clock=?
+             WHERE intent_id=?",
+        )
+        .bind(slot.to_string())
+        .bind(res.clock.map(|clock| clock.to_string()))
+        .bind(id)
+        .execute(&mut *db)
+        .await?;
         db::audit(
             s,
             db,
@@ -458,48 +533,113 @@ impl Chain {
         }
         .seal()?)
     }
-    pub(super) async fn discover_refunds(&self, s: &State) -> Result<()> {
-        let orders: Vec<(String, Option<String>)> = sqlx::query_as(
-            "SELECT order_id,delivery_id FROM orders WHERE state IN ('Funded','Delivered') ",
-        )
-        .fetch_all(&s.pool)
-        .await?;
-        for (order, delivery) in orders {
+    pub(super) async fn discover_terminals(&self, s: &State) -> Result<()> {
+        let orders: Vec<String> =
+            sqlx::query_scalar("SELECT order_id FROM orders WHERE state IN ('Funded','Delivered')")
+                .fetch_all(&s.pool)
+                .await?;
+        for order in orders {
             let mut db = s.pool.begin_with("BEGIN IMMEDIATE").await?;
-            let e = Evidence::load(s, &mut db, &order, delivery.as_deref(), None).await?;
-            let (_, q) = e.agreement.terms(&s.config.environment)?;
-            let due = if delivery.is_some() {
-                &q.deadlines.resolve_by
-            } else {
-                &q.deadlines.deliver_by
-            };
-            if self.clock()? < settle463_core::ident::timestamp(due)? {
-                continue;
-            }
-            let expected = e.expected(self, ChainAction::Refund, true)?;
-            let Some((sig, res)) = chain_call(|| self.rpc.find_refund(&expected))? else {
-                continue;
-            };
-            if res.outcome != ChainOutcome::FinalizedSuccess {
-                continue;
-            }
-            let managed:i64=sqlx::query_scalar("SELECT COUNT(*) FROM intents WHERE local_signature=? AND last_valid_block_height IS NOT NULL").bind(&sig).fetch_one(&mut *db).await?;
-            if managed != 0 {
-                continue;
-            }
-            let id = hex_string(&message_id(sig.as_bytes()));
-            sqlx::query("INSERT INTO intents(intent_id,order_id,action,state,signed_bytes,local_signature,delivery_message) VALUES(?,?,'refund','observed',x'',?,?) ON CONFLICT(intent_id) DO NOTHING")
-                .bind(&id).bind(&order).bind(&sig).bind(&delivery).execute(&mut *db).await?;
-            let row = sqlx::query("SELECT * FROM intents WHERE intent_id=?")
-                .bind(&id)
-                .fetch_one(&mut *db)
-                .await?;
-            self.finalize(s, &mut db, &row, &e, ChainAction::Refund, &res)
-                .await?;
+            self.observe_terminal(s, &mut db, &order).await?;
             db.commit().await?;
         }
         Ok(())
     }
+
+    async fn observe_terminal(&self, s: &State, db: &mut Conn, order: &str) -> Result<()> {
+        let Some(row) = sqlx::query(
+            "SELECT delivery_id,definitive_id FROM orders
+             WHERE order_id=? AND state IN ('Funded','Delivered')",
+        )
+        .bind(order)
+        .fetch_optional(&mut *db)
+        .await?
+        else {
+            return Ok(());
+        };
+        let mut e = Evidence::load(s, db, order, None, None).await?;
+        let inspect = e.expected(self, ChainAction::Fund, false)?;
+        let Some(view) = chain_call(|| self.rpc.inspect(&inspect))? else {
+            return Ok(());
+        };
+        let kind = match view.state {
+            OrderState::Refunded => ChainAction::Refund,
+            OrderState::Paid => ChainAction::Release,
+            _ => return Ok(()),
+        };
+        let delivery: Option<String> = row.get("delivery_id");
+        let verdict: Option<String> = row.get("definitive_id");
+        if delivery != view.delivery_id
+            || (kind == ChainAction::Release && verdict != view.verdict_id)
+        {
+            return gap(s, db, order, "missing linked delivery or verdict").await;
+        }
+        if let Some(id) = &delivery {
+            e.delivery = Some(db::load(db, id, &s.config.environment).await?);
+        }
+        if let Some(id) = &view.verdict_id {
+            e.verdict = Some(db::load(db, id, &s.config.environment).await?);
+        }
+        let expected = e.expected(self, kind, true)?;
+        let Some((sig, res)) = chain_call(|| self.rpc.find_terminal(&expected))? else {
+            return gap(s, db, order, "missing finalized terminal transaction").await;
+        };
+        let existing: Option<(String, bool)> = sqlx::query_as(
+            "SELECT intent_id,last_valid_block_height IS NOT NULL AS managed FROM intents
+             WHERE order_id=? AND action=? AND local_signature=? ORDER BY managed DESC LIMIT 1",
+        )
+        .bind(order)
+        .bind(kind.name())
+        .bind(&sig)
+        .fetch_optional(&mut *db)
+        .await?;
+        let id = match existing {
+            Some((_, true)) => return Ok(()),
+            Some((id, false)) => id,
+            None => observed_intent_id(order, kind, &sig)?,
+        };
+        sqlx::query(
+            "INSERT INTO intents(
+                intent_id,order_id,action,state,signed_bytes,local_signature,delivery_message,verdict_message
+             ) VALUES(?,?,?,'observed',x'',?,?,?) ON CONFLICT(intent_id) DO NOTHING",
+        )
+        .bind(&id).bind(order).bind(kind.name()).bind(&sig).bind(&delivery).bind(&view.verdict_id)
+        .execute(&mut *db).await?;
+        let row = sqlx::query("SELECT * FROM intents WHERE intent_id=?")
+            .bind(&id)
+            .fetch_one(&mut *db)
+            .await?;
+        match self.finalize(s, db, &row, &e, kind, &res).await {
+            Err(error) if error.1 == "LEDGER_UNAVAILABLE" => {
+                gap(s, db, order, "missing preceding finalized transaction").await
+            }
+            other => other,
+        }
+    }
+}
+// One external transaction may settle several orders in separate instructions.
+fn observed_intent_id(order: &str, action: ChainAction, signature: &str) -> Result<String> {
+    Ok(digest(&preimage(
+        b"0x463/solana-observed-intent/0.1",
+        &json!({"order_id":order,"action":action.name(),"signature":signature}),
+    )?))
+}
+async fn gap(s: &State, db: &mut Conn, order: &str, reason: &str) -> Result<()> {
+    let seen: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM audit_events WHERE order_id=? AND event_type='reconciliation_gap')",
+    ).bind(order).fetch_one(&mut *db).await?;
+    if !seen {
+        db::audit(
+            s,
+            db,
+            order,
+            "reconciliation_gap",
+            &json!({"reason": reason}),
+            vec![],
+        )
+        .await?;
+    }
+    Ok(())
 }
 async fn retry(
     db: &mut Conn,
@@ -531,4 +671,20 @@ fn stored_tx(row: &sqlx::sqlite::SqliteRow) -> Result<SignedTx> {
         context_slot: decimal(row.get("context_slot"))?,
         last_valid_block_height: decimal(row.get("last_valid_block_height"))?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_external_transaction_can_settle_multiple_orders() {
+        let sig = bs58::encode([7; 64]).into_string();
+        let first = "01".repeat(32);
+        let second = "02".repeat(32);
+        let refund = |order: &str| observed_intent_id(order, ChainAction::Refund, &sig).unwrap();
+        assert_ne!(refund(&first), refund(&second));
+        assert_ne!(refund(&first), observed_intent_id(&first, ChainAction::Release, &sig).unwrap());
+        assert_ne!(refund(&first), digest(sig.as_bytes()));
+    }
 }

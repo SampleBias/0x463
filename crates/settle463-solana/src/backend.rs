@@ -55,7 +55,12 @@ impl<J: IntentJournal> OrderBackend<J> {
             journal,
         })
     }
-    fn expected(&self, action: ChainAction, evidence: Option<&SignedMessage>) -> Result<Expected> {
+    fn expected(
+        &self,
+        action: ChainAction,
+        evidence: Option<&SignedMessage>,
+        payer: &str,
+    ) -> Result<Expected> {
         let (delivery, verdict) = match action {
             ChainAction::Fund => (None, None),
             ChainAction::CommitDelivery => (evidence.or(self.delivery.as_ref()), None),
@@ -68,7 +73,7 @@ impl<J: IntentJournal> OrderBackend<J> {
             action,
             delivery,
             verdict,
-            &self.payer,
+            payer,
         )
     }
     fn prepare(&self, e: Expected) -> DomainResult<NativeReview> {
@@ -120,7 +125,7 @@ impl<J: IntentJournal> SettlementBackend<NativeReview, NativeReview, Vec<String>
         )
         .map_err(domain)?;
         if self
-            .expected(ChainAction::Fund, None)
+            .expected(ChainAction::Fund, None, &self.payer)
             .map_err(domain)?
             .terms
             != e.terms
@@ -131,7 +136,8 @@ impl<J: IntentJournal> SettlementBackend<NativeReview, NativeReview, Vec<String>
     }
     fn submit_fund(&self, review: &NativeReview, sigs: &Vec<String>) -> DomainResult<Submission> {
         self.submit(
-            self.expected(ChainAction::Fund, None).map_err(domain)?,
+            self.expected(ChainAction::Fund, None, &self.payer)
+                .map_err(domain)?,
             &review.prepared,
             sigs,
         )
@@ -147,7 +153,9 @@ impl<J: IntentJournal> SettlementBackend<NativeReview, NativeReview, Vec<String>
             Action::Release => ChainAction::Release,
             Action::Refund => ChainAction::Refund,
         };
-        let e = self.expected(action, evidence).map_err(domain)?;
+        let e = self
+            .expected(action, evidence, &self.payer)
+            .map_err(domain)?;
         if order != e.terms.order_id {
             return Err(FundingError::OrderMissing);
         }
@@ -163,7 +171,7 @@ impl<J: IntentJournal> SettlementBackend<NativeReview, NativeReview, Vec<String>
             return Err(FundingError::Linkage);
         }
         let e = self
-            .expected(review.expected.action, evidence)
+            .expected(review.expected.action, evidence, &self.payer)
             .map_err(domain)?;
         self.submit(e, &review.prepared, signature.ok_or(FundingError::Linkage)?)
     }
@@ -187,7 +195,7 @@ impl<J: IntentJournal> SettlementBackend<NativeReview, NativeReview, Vec<String>
         let Some((action, signed)) = self.journal.find(&q.order_id, id).map_err(domain)? else {
             return Ok(ChainOutcome::Unknown);
         };
-        let e = self.expected(action, None).map_err(domain)?;
+        let e = self.expected(action, None, "").map_err(domain)?;
         self.rpc
             .reconcile(&e, id, Some(&signed))
             .map(|r| r.outcome)

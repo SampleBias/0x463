@@ -1,6 +1,8 @@
 """Drive the public CLI and compare finalized SPL deltas against the simulator."""
 import argparse
 import base64
+import hashlib
+import signal
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,7 +14,9 @@ import sqlite3
 import struct
 import subprocess
 import sys
-from threading import Thread
+from threading import Event, Thread
+from urllib.request import Request, ProxyHandler, build_opener
+from solders.transaction import Transaction
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]/"scripts"))
@@ -80,26 +84,48 @@ def verify(session, url, code=0):
 
 
 @contextmanager
-def evidence_rpc(url, signature, mode):
+def proxy_rpc(url, transform):
     class Proxy(BaseHTTPRequestHandler):
         def do_POST(self):
-            req=json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            method, params=req["method"],req.get("params",[])
-            result=rpc(url,method,params)
-            if method=="getTransaction" and params[0]==signature:
-                if mode=="missing": result=None
-                else: result["meta"]["err"]={"InstructionError":[0,{"Custom":6005}]}
-            if method=="getSignatureStatuses" and signature in params[0] and mode=="missing":
-                result["value"]=[None]*len(params[0])
-            body=json.dumps({"id":req["id"],"jsonrpc":"2.0","result":result}).encode()
-            self.send_response(200);self.send_header("Content-Type","application/json")
-            self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
-        def log_message(self,*args):
+            raw = self.rfile.read(int(self.headers["Content-Length"]))
+            req = json.loads(raw)
+            upstream = Request(url, data=raw, headers={"Content-Type": "application/json"})
+            with build_opener(ProxyHandler({})).open(upstream, timeout=15) as response:
+                reply = json.load(response)
+            if not transform(req["method"], req.get("params", []), reply):
+                self.close_connection = True
+                return
+            body = json.dumps(reply).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
             pass
-    with ThreadingHTTPServer(("127.0.0.1",0),Proxy) as server:
-        thread=Thread(target=server.serve_forever,daemon=True);thread.start()
-        try: yield f"http://127.0.0.1:{server.server_port}"
-        finally: server.shutdown();thread.join()
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Proxy) as server:
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_port}"
+        finally:
+            server.shutdown()
+            thread.join()
+
+
+def evidence_rpc(url, signature, mode):
+    def change(method, params, reply):
+        if method == "getTransaction" and params[0] == signature:
+            if mode == "missing":
+                reply["result"] = None
+            else:
+                reply["result"]["meta"]["err"] = {"InstructionError": [0, {"Custom": 6005}]}
+        if method == "getSignatureStatuses" and signature in params[0] and mode == "missing":
+            reply["result"]["value"] = [None] * len(params[0])
+        return True
+    return proxy_rpc(url, change)
 
 
 def demo(case, private, dep, public):
@@ -148,14 +174,48 @@ def demo(case, private, dep, public):
 
 
 def recovery(action, private, dep, public):
-    directory=private/"interrupted"
-    crash_env=dict(os.environ,SETTLE463_TEST_STOP="after_broadcast:"+action)
-    cli("demo","--scenario","pass","--backend","local-validator","--deployment",private/"deployment.json","--output-dir",directory,
-        code=1,env=crash_env)
+    directory = private/"interrupted"
+    discriminator = hashlib.sha256(("global:"+action).encode()).digest()[:8]
+    program = Pubkey.from_string(dep["program_id"])
+    lost = Event()
+    interrupted = {}
+
+    def lose_response(method, params, reply):
+        if action == "release" and method == "getTransaction" and reply.get("result"):
+            reply["result"]["blockTime"] = None
+        if method != "sendTransaction" or "result" not in reply or lost.is_set():
+            return True
+        tx = Transaction.from_bytes(base64.b64decode(params[0]))
+        if not any(tx.message.account_keys[ix.program_id_index] == program and
+                   bytes(ix.data).startswith(discriminator) for ix in tx.message.instructions):
+            return True
+        assert str(tx.signatures[0]) == reply["result"]
+        # The validator has accepted the transaction. Stop this demo's daemon before replying over HTTP.
+        children = Path(f"/proc/{process.pid}/task/{process.pid}/children").read_text().split()
+        servers = [int(c) for c in children if b"__serve" in Path(f"/proc/{c}/cmdline").read_bytes().split(bytes(1))]
+        assert len(servers) == 1, servers
+        interrupted["signature"] = reply["result"]
+        os.kill(servers[0], signal.SIGKILL)
+        lost.set()
+        return False
+
+    with proxy_rpc(dep["rpc_url"], lose_response) as proxy:
+        save(private/"deployment.json", {**dep, "rpc_url": proxy})
+        with subprocess.Popen([str(CLI), "demo", "--scenario", "pass", "--backend", "local-validator",
+                               "--deployment", str(private/"deployment.json"), "--output-dir", str(directory)],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            stdout, stderr = process.communicate(timeout=250)
+            assert lost.is_set() and process.returncode != 0, (action,stdout,stderr)
+        result = recovered(action, directory, private, dep, interrupted["signature"])
+    save(public/("recovery-"+action+".json"),result)
+    print("VALIDATOR_RECOVERY "+json.dumps(result,separators=(",",":")),flush=True)
+
+
+def recovered(action, directory, private, dep, accepted_signature):
     trust=json.loads((directory/"trust.json").read_bytes());order=trust["trusted_order"]
     with sqlite3.connect(directory/"coordinator.sqlite") as db:
         sig,raw=db.execute("select local_signature,signed_bytes from intents where action=? and order_id=?",(action,order)).fetchone()
-        assert len(raw)>64 and db.execute("select count(*) from receipts").fetchone()[0]==0
+        assert sig==accepted_signature and len(raw)>64 and db.execute("select count(*) from receipts").fetchone()[0]==0
     tx=confirmed_tx(dep["rpc_url"],sig); buyer=associated(key(private,"buyer").pubkey(),Pubkey.from_string(dep["mint"]))
     seller=associated(key(private,"seller").pubkey(),Pubkey.from_string(dep["mint"]))
     def balance(account):
@@ -172,9 +232,7 @@ def recovery(action, private, dep, public):
         snapshots.append([balance(buyer),balance(seller),int(view["held"]),receipts])
     assert snapshots==[[3000000,0,2000000,0] if action=="fund" else [3000000,2000000,0,1]]*2
     if action=="release": verify(directory,dep["rpc_url"])
-    result=dict(action=action,signature=sig,slot=tx["slot"],order_id=order,restart_snapshots=snapshots)
-    save(public/("recovery-"+action+".json"),result)
-    print("VALIDATOR_RECOVERY "+json.dumps(result,separators=(",",":")),flush=True)
+    return dict(action=action,signature=sig,slot=tx["slot"],order_id=order,restart_snapshots=snapshots)
 
 
 def main():
@@ -182,11 +240,15 @@ def main():
     public=parser.parse_args().output.resolve();public.mkdir(parents=True)
     fixture=Path(os.environ["PHASE_D_FIXTURE"]);dep=json.loads((fixture/"deployment.json").read_bytes())
     save(public/"deployment.json",dep)
-    commands=[*CASES,"recover-fund","recover-release"]
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    commands=[*CASES,"recover-fund","recover-release","adapter-recovery"]
+    with ThreadPoolExecutor(max_workers=8) as pool:
         def run(name):
             private=new_parties(fixture,name,dep)
-            if name in CASES: demo(name,private,dep,public)
+            if name == "adapter-recovery":
+                subprocess.run(["cargo", "test", "--locked", "--offline", "-p", "settle463-solana",
+                                "--test", "validator_recovery", "--", "--ignored", "--nocapture"],
+                               env=dict(os.environ,PHASE_D_ADAPTER_FIXTURE=str(private)),check=True)
+            elif name in CASES: demo(name,private,dep,public)
             else: recovery(name.removeprefix("recover-"),private,dep,public)
         futures=[pool.submit(run,name) for name in commands]
         program=pool.submit(subprocess.run,[sys.executable,"programs/settle463-escrow/tests/validator.py",

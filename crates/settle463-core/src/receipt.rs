@@ -74,13 +74,8 @@ pub fn make_solana_receipt(
     view: &OrderView,
     failed_verdict: Option<&SignedMessage>,
 ) -> Result<Receipt, ReceiptError> {
-    terminal_receipt(
-        view,
-        failed_verdict,
-        "solana",
-        "finalized",
-        Some(view.terminal_clock.ok_or(InvalidEvidence)?),
-    )
+    // The program checks Clock during execution. Finalized RPC history can omit blockTime.
+    terminal_receipt(view, failed_verdict, "solana", "finalized", None)
 }
 
 fn terminal_receipt(

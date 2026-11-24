@@ -178,6 +178,30 @@ mod tests {
     }
 
     #[test]
+    fn mint_requires_classic_ownership_initialization_and_six_decimals() {
+        for (owner, decimals, initialized, accepted) in [
+            (anchor_spl::token::ID, 6, true, true),
+            (anchor_spl::token::ID, 9, true, false),
+            (anchor_spl::token::ID, 6, false, false),
+            (Pubkey::default(), 6, true, false),
+        ] {
+            let key = Pubkey::new_unique();
+            let mut lamports = 1;
+            let mut data = [0u8; anchor_spl::token::Mint::LEN];
+            data[44] = decimals;
+            data[45] = u8::from(initialized);
+            let account =
+                AccountInfo::new(&key, false, false, &mut lamports, &mut data, &owner, false);
+            let result = crate::check_mint(&account);
+            if accepted {
+                result.unwrap();
+            } else {
+                assert_eq!(code(result), 6004);
+            }
+        }
+    }
+
+    #[test]
     fn terminal_state_and_ledger_deadline_boundaries() {
         for (time, allowed) in [(24, true), (25, false), (26, false)] {
             let funded = escrow(FUNDED, 0);

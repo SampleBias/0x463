@@ -6,6 +6,33 @@ use solana_instruction::{AccountMeta as Meta, Instruction};
 use solana_message::Message;
 
 const MAX_WIRE: usize = 1232;
+const MAX_COMPUTE_UNITS: u32 = 1_400_000;
+
+fn authorize_fees(msg: &Message) -> Result<()> {
+    let program = key(COMPUTE)?;
+    let mut limit_set = false;
+    let mut price_set = false;
+    for ix in &msg.instructions {
+        if msg.account_keys.get(usize::from(ix.program_id_index)) != Some(&program) {
+            continue;
+        }
+        match ix.data.as_slice() {
+            [2, a, b, c, d]
+                if !limit_set
+                    && (1..=MAX_COMPUTE_UNITS).contains(&u32::from_le_bytes([*a, *b, *c, *d])) =>
+            {
+                limit_set = true;
+            }
+            [3, 0, 0, 0, 0, 0, 0, 0, 0] if !price_set => price_set = true,
+            _ => {
+                return Err(invalid(
+                    "local signer requires zero priority fee and a valid compute unit limit",
+                ))
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -308,6 +335,7 @@ impl Expected {
     ) -> Result<String> {
         self.payer()?;
         let (msg, raw) = self.prepared(prepared)?;
+        authorize_fees(&msg)?;
         let pubkey = from_hex(public_hex)?;
         ensure(
             msg.account_keys[..usize::from(msg.header.num_required_signatures)].contains(&pubkey),
