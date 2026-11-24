@@ -265,6 +265,13 @@ async fn open(c: Config) -> std::result::Result<Shared, BoxError> {
             include_str!("../migrations/0003_terminal_replay.sql").into(),
             false,
         ),
+        Migration::new(
+            4,
+            "Solana prepared message validity".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0004_solana_preparations.sql").into(),
+            false,
+        ),
     ];
     Migrator {
         migrations: migrations.into(),

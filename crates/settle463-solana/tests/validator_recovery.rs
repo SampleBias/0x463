@@ -203,7 +203,8 @@ fn expired_fund_and_rpc_recovery_deposit_once() -> Result<()> {
         ])
     };
     assert!(rpc.inspect(&e)?.is_none());
-    assert_eq!(balances()?, [5_000_000, 0, 0]);
+    let opening = balances()?;
+    assert_eq!(opening, [5_000_000, 0, 0]);
 
     let first = rpc.prepare(&e)?;
     let old_signatures = signatures(&rpc, &e, &first, &parties)?;
@@ -245,11 +246,11 @@ fn expired_fund_and_rpc_recovery_deposit_once() -> Result<()> {
         ..deployment.clone()
     };
     let unreachable = Rpc::new(&disconnected)?;
-    assert!(unreachable.broadcast(&tx).unwrap_err().is_unavailable());
-    assert!(unreachable
+    let broadcast_error = unreachable.broadcast(&tx).unwrap_err();
+    let reconcile_error = unreachable
         .reconcile(&expected(&disconnected)?, &tx.signature, Some(&tx))
-        .unwrap_err()
-        .is_unavailable());
+        .unwrap_err();
+    assert!(broadcast_error.is_unavailable() && reconcile_error.is_unavailable());
     thread::sleep(Duration::from_secs(1));
     assert_eq!(balances()?, [5_000_000, 0, 0]);
     rpc.broadcast(&tx)?;
@@ -262,7 +263,8 @@ fn expired_fund_and_rpc_recovery_deposit_once() -> Result<()> {
         Duration::from_secs(100),
     )?;
     assert_eq!(rpc.reconcile(&e, &tx.signature, Some(&tx))?, finalized);
-    assert_eq!(balances()?, [3_000_000, 2_000_000, 0]);
+    let closing = balances()?;
+    assert_eq!(closing, [3_000_000, 2_000_000, 0]);
     assert_eq!(
         rpc.inspect(&e)?.ok_or("missing funded order")?.state,
         OrderState::Funded
@@ -287,7 +289,9 @@ fn expired_fund_and_rpc_recovery_deposit_once() -> Result<()> {
             "expired_signature":unused.signature, "expired_last_valid_height":first.last_valid_block_height,
             "expired_context_slot":first.context_slot, "renewed_context_slot":second.context_slot,
             "funding_signature":tx.signature, "finalized_slot":finalized.slot, "finalized_escrow_transactions":rows.len(),
-            "buyer_delta":-2_000_000, "vault_delta":2_000_000, "seller_delta":0
+            "broadcast_error":broadcast_error.to_string(), "reconcile_error":reconcile_error.to_string(),
+            "buyer_delta":i128::from(closing[0])-i128::from(opening[0]), "vault_delta":i128::from(closing[1])-i128::from(opening[1]),
+            "seller_delta":i128::from(closing[2])-i128::from(opening[2])
         })
     );
     Ok(())

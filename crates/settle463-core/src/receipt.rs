@@ -257,7 +257,15 @@ fn decode<L: serde::de::DeserializeOwned + Serialize>(
     bytes: &[u8],
     prefix: &str,
 ) -> Result<Bundle<L>, ReceiptError> {
-    let parsed = canonical::parse(bytes).map_err(|_| InvalidEvidence)?;
+    let mut parsed = canonical::parse(bytes).map_err(|_| InvalidEvidence)?;
+    if prefix == "solana:" {
+        // Routing comes exclusively from the caller's command line and detached trust inputs.
+        if let Some(hint) = parsed.as_object_mut().and_then(|o| o.remove("rpc_url")) {
+            if hint.as_str().is_none_or(|url| url.len() > 4096) {
+                return Err(InvalidEvidence);
+            }
+        }
+    }
     let b: Bundle<L> = serde_json::from_value(parsed.clone()).map_err(|_| InvalidEvidence)?;
     if b.bundle_version != "0.1"
         || !b.environment.starts_with(prefix)

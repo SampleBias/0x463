@@ -89,7 +89,7 @@ fn example(action: ChainAction) -> Expected {
 }
 fn signed(e: &Expected) -> SignedTx {
     let prep = e
-        .build(&Pubkey::new_from_array([9; 32]).to_string(), 60, 10)
+        .build(&Pubkey::new_from_array([9; 32]).to_string(), 160, 10)
         .unwrap();
     let roles: Vec<_> = match e.action {
         ChainAction::Fund | ChainAction::CommitDelivery => vec![1, 2],
@@ -253,7 +253,7 @@ fn escrow_bytes(e: &Expected) -> Vec<u8> {
                 b"settle463",
                 b"escrow",
                 b"v1",
-                address(&actor(1)).as_ref(),
+                from_hex(&r.buyer).unwrap().as_ref(),
                 &e.nonce,
             ],
             &key(&e.deployment.program_id).unwrap(),
@@ -272,6 +272,10 @@ struct Responses {
     transaction: Value,
     escrow: Option<Vec<u8>>,
     height: u64,
+    skipped_slot: Option<u64>,
+    missing_block: Option<u64>,
+    landed: Option<(u64, String)>,
+    scanned_blocks: Vec<u64>,
     earliest: u64,
     valid: bool,
     vault_balance: u64,
@@ -282,7 +286,7 @@ struct Ledger {
 }
 impl Transport for Ledger {
     fn call(&self, m: &str, p: Value) -> Result<Value> {
-        let s = self.state.lock().unwrap();
+        let mut s = self.state.lock().unwrap();
         if s.disconnected {
             return Err(Error::Unavailable("private RPC disconnected".into()));
         }
@@ -292,14 +296,43 @@ impl Transport for Ledger {
             "getTransaction" => s.transaction.clone(),
             "getSignatureStatuses" => json!({"value":[s.status]}),
             "getBlockHeight" => json!(s.height),
-            "isBlockhashValid" => json!({"context":{"slot":12},"value":s.valid}),
+            "isBlockhashValid" => json!({"context":{"slot":s.height},"value":s.valid}),
+            "getBlocksWithLimit" => {
+                let (start, count) = (p[0].as_u64().unwrap(), p[1].as_u64().unwrap());
+                assert_eq!(p[2]["commitment"], "finalized");
+                json!((start..=s.height)
+                    .filter(|slot| s.skipped_slot != Some(*slot))
+                    .take(count as usize)
+                    .collect::<Vec<_>>())
+            }
             "getBlock" => {
                 let slot = p[0].as_u64().unwrap();
+                s.scanned_blocks.push(slot);
+                if Some(slot) == s.missing_block {
+                    return Ok(Value::Null);
+                }
                 let key_for = |slot: u64| {
-                    Pubkey::new_from_array([if slot == 10 { 9 } else { slot as u8 }; 32])
-                        .to_string()
+                    if slot == 10 {
+                        return Pubkey::new_from_array([9; 32]).to_string();
+                    }
+                    let mut bytes = [0; 32];
+                    bytes[..8].copy_from_slice(&slot.to_le_bytes());
+                    Pubkey::new_from_array(bytes).to_string()
                 };
-                json!({"blockhash":key_for(slot),"previousBlockhash":key_for(slot-1),"parentSlot":slot-1,"signatures":[]})
+                let signatures: Vec<_> = s
+                    .landed
+                    .iter()
+                    .filter(|(at, _)| *at == slot)
+                    .map(|(_, sig)| sig)
+                    .collect();
+                let parent = slot.saturating_sub(1);
+                let parent = if s.skipped_slot == Some(parent) {
+                    parent.saturating_sub(1)
+                } else {
+                    parent
+                };
+                let height = slot - u64::from(s.skipped_slot.is_some_and(|skipped| skipped < slot));
+                json!({"blockhash":key_for(slot),"previousBlockhash":key_for(parent),"parentSlot":parent,"blockHeight":height,"signatures":signatures})
             }
             "getFirstAvailableBlock" => json!(s.earliest),
             "getMultipleAccounts" => {
@@ -394,20 +427,62 @@ fn dropped_observations_archival_gaps_and_finalized_failures_are_distinct() {
     assert_eq!(reconcile(), ChainOutcome::Unknown);
     {
         let mut s = mock.state.lock().unwrap();
-        s.height = 70;
+        s.height = 180;
         s.earliest = 11;
     }
     assert_eq!(reconcile(), ChainOutcome::Unknown);
     mock.state.lock().unwrap().earliest = 1;
     assert_eq!(reconcile(), ChainOutcome::Expired);
     mock.state.lock().unwrap().escrow = Some(escrow_bytes(&e));
-    assert_eq!(reconcile(), ChainOutcome::Unknown);
+    assert_eq!(reconcile(), ChainOutcome::Expired);
     mock.state.lock().unwrap().transaction = json!({"slot":21,"blockTime":45,"transaction":[tx.wire,"base64"],"meta":{"err":{"InstructionError":[1,"Custom"]}}});
     assert_eq!(reconcile(), ChainOutcome::FinalizedFailure);
     assert!(!rpc
         .reconcile(&e, &bs58::encode([7; 64]).into_string(), None)
         .unwrap_err()
         .is_unavailable());
+}
+#[test]
+fn expiry_after_long_downtime_checks_only_the_real_window_and_binds_its_metadata() {
+    let e = example(ChainAction::Fund);
+    let tx = signed(&e);
+    let mock = Arc::new(Ledger {
+        dep: e.deployment.clone(),
+        state: Mutex::new(Responses {
+            height: 300_000,
+            ..Responses::default()
+        }),
+    });
+    let rpc = Rpc::with_transport(e.deployment.clone(), mock.clone());
+    let reconcile = |tx: &SignedTx| rpc.reconcile(&e, &tx.signature, Some(tx));
+    assert_eq!(reconcile(&tx).unwrap().outcome, ChainOutcome::Expired);
+    assert_eq!(
+        mock.state.lock().unwrap().scanned_blocks,
+        (10..=161).collect::<Vec<_>>()
+    );
+    for (slot, height) in [(10, 44), (10, u64::MAX), (11, 161)] {
+        let bad = SignedTx {
+            context_slot: slot,
+            last_valid_block_height: height,
+            ..tx.clone()
+        };
+        assert!(matches!(reconcile(&bad), Err(Error::Invalid(_))));
+    }
+    {
+        let mut s = mock.state.lock().unwrap();
+        s.skipped_slot = Some(40);
+        s.scanned_blocks.clear();
+    }
+    assert_eq!(reconcile(&tx).unwrap().outcome, ChainOutcome::Expired);
+    assert_eq!(
+        mock.state.lock().unwrap().scanned_blocks,
+        (10..=162).filter(|s| *s != 40).collect::<Vec<_>>()
+    );
+    mock.state.lock().unwrap().missing_block = Some(82);
+    assert_eq!(reconcile(&tx).unwrap().outcome, ChainOutcome::Unknown);
+    mock.state.lock().unwrap().missing_block = None;
+    mock.state.lock().unwrap().landed = Some((162, tx.signature.clone()));
+    assert_eq!(reconcile(&tx).unwrap().outcome, ChainOutcome::Unknown);
 }
 #[test]
 fn finalized_fund_requires_its_historical_delta_and_own_checked_cpi() {
@@ -471,7 +546,7 @@ fn expired_message_requires_new_authorizations_from_both_funding_signers() {
     });
     let rpc = Rpc::with_transport(e.deployment.clone(), mock.clone());
     let mut prepared = e
-        .build(&Pubkey::new_from_array([9; 32]).to_string(), 60, 10)
+        .build(&Pubkey::new_from_array([9; 32]).to_string(), 160, 10)
         .unwrap();
     let called = std::cell::Cell::new(false);
     let buyer = actor(1);
@@ -603,4 +678,95 @@ fn external_refund_requires_its_own_checked_transfer_and_terminal_replays_preser
         replay.known_terminal,
         Some(settle463_core::settlement::OrderState::Refunded)
     );
+}
+
+#[test]
+fn a_batched_refund_verifies_each_order_against_its_own_invocation() {
+    let mut first = example(ChainAction::Refund);
+    first.payer = None;
+    let mut second = first.clone();
+    second.nonce = [22; 32];
+    second.terms.buyer = hex_string(actor(22).verifying_key().as_bytes());
+    second.terms.order_id = hex_string(
+        &settle463_core::order_id(
+            &second.terms.environment,
+            &second.terms.buyer,
+            &hex_string(&second.nonce),
+        )
+        .unwrap(),
+    );
+    let Settlement::Solana {
+        escrow_pda,
+        vault_token_account,
+        buyer_token_account,
+        ..
+    } = second
+        .deployment
+        .settlement(
+            &second.terms.buyer,
+            &second.terms.seller,
+            &hex_string(&second.nonce),
+        )
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    second.terms.escrow_account = escrow_pda;
+    second.terms.buyer_destination = buyer_token_account;
+    second.vault = key(&vault_token_account).unwrap();
+    let orders = [&first, &second];
+    let fee_payer = actor(14);
+    let payer = address(&fee_payer);
+    let refunds = orders.map(|e| e.escrow_ix(payer).unwrap());
+    let message = Message::new(&refunds, Some(&payer));
+    let raw = message.serialize();
+    let sig = fee_payer.sign(&raw).to_bytes();
+    let locator = bs58::encode(sig).into_string();
+    let wire = STANDARD.encode([&[1u8][..], &sig[..], &raw].concat());
+    let idx = |k| message.account_keys.iter().position(|x| x == &k).unwrap();
+    let amount = |i, value: &str| json!({"accountIndex":i,"mint":first.deployment.mint,"uiTokenAmount":{"amount":value,"decimals":6}});
+    let mut pre = vec![];
+    let mut post = vec![];
+    let mut invocations = vec![];
+    let transfer = [vec![12], 2_000_000u64.to_le_bytes().to_vec(), vec![6]].concat();
+    for (index, e) in orders.iter().enumerate() {
+        let v = idx(e.vault);
+        let b = idx(key(&e.terms.buyer_destination).unwrap());
+        pre.extend([amount(v, "2000001"), amount(b, "3000000")]);
+        post.extend([amount(v, "1"), amount(b, "5000000")]);
+        invocations.push(json!({"index":index,"instructions":[{
+            "programIdIndex":idx(key(TOKEN_PROGRAM).unwrap()),
+            "accounts":[v,idx(key(&e.deployment.mint).unwrap()),b,idx(key(&e.terms.escrow_account).unwrap())],
+            "data":bs58::encode(&transfer).into_string(),"stackHeight":2
+        }]}));
+    }
+    let response = json!({"slot":90,"blockTime":201,"transaction":[wire,"base64"],"meta":{"err":null,
+        "innerInstructions":invocations,"preTokenBalances":pre,"postTokenBalances":post}});
+    for (index, e) in orders.iter().enumerate() {
+        let mut escrow = escrow_bytes(e);
+        escrow[488] = 3;
+        let mock = Arc::new(Ledger {
+            dep: e.deployment.clone(),
+            state: Mutex::new(Responses {
+                transaction: response.clone(),
+                escrow: Some(escrow),
+                ..Responses::default()
+            }),
+        });
+        let rpc = Rpc::with_transport(e.deployment.clone(), mock.clone());
+        assert_eq!(
+            rpc.reconcile(e, &locator, None).unwrap().outcome,
+            ChainOutcome::FinalizedSuccess
+        );
+        let mut other_cpi = response.clone();
+        other_cpi["meta"]["innerInstructions"][index]["instructions"] =
+            response["meta"]["innerInstructions"][1 - index]["instructions"].clone();
+        mock.state.lock().unwrap().transaction = other_cpi;
+        assert!(matches!(
+            rpc.reconcile(e, &locator, None),
+            Err(Error::Invalid(_))
+        ));
+    }
+    let duplicate = Message::new(&[refunds[0].clone(), refunds[0].clone()], Some(&payer));
+    assert!(first.external_refund(&duplicate).is_err());
 }

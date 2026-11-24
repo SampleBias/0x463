@@ -159,8 +159,21 @@ def demo(case, private, dep, public):
     assert pda["lamports"]>=rent
     if case=="pass":
         assert "buyer_download length=52 sha256=37ba5c2e" in run.stderr
+        contacted = Event()
+        def trap_endpoint(method, params, reply):
+            contacted.set()
+            return True
+        with proxy_rpc(url, trap_endpoint) as unapproved:
+            hinted = {**bundle, "rpc_url": unapproved}
+            save(session/"hint.json", hinted)
+            cli("receipt","verify",session/"hint.json","--trust-file",session/"trust.json",code=1)
+            trusted = cli("receipt","verify",session/"hint.json","--rpc",url,"--trust-file",session/"trust.json")
+            assert trusted.stdout.strip()=="ledger_verified" and not contacted.is_set()
         for mode,exit_code in (("missing",5),("failed",2)):
             with evidence_rpc(url,ledger["terminal_signature"],mode) as proxy: verify(session,proxy,exit_code)
+        wrong_pin = cli("receipt", "verify", session/"receipt.json", "--rpc", url,
+                        "--trust-file", session/"trust.json", "--program-id", str(SYSTEM), code=2)
+        assert wrong_pin.stdout.strip() == "invalid_evidence"
         changed=json.loads((session/"receipt.json").read_bytes());changed["ledger"]["program_id"]=str(SYSTEM)
         save(session/"tampered.json",changed)
         assert cli("receipt","verify",session/"tampered.json","--rpc",url,"--trust-file",session/"trust.json",code=2).stdout.strip()=="invalid_evidence"
@@ -181,6 +194,8 @@ def recovery(action, private, dep, public):
     interrupted = {}
 
     def lose_response(method, params, reply):
+        if method == "getTransaction" and params[0] == interrupted.get("hide_funding"):
+            reply["result"] = None
         if action == "release" and method == "getTransaction" and reply.get("result"):
             reply["result"]["blockTime"] = None
         if method != "sendTransaction" or "result" not in reply or lost.is_set():
@@ -206,6 +221,16 @@ def recovery(action, private, dep, public):
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
             stdout, stderr = process.communicate(timeout=250)
             assert lost.is_set() and process.returncode != 0, (action,stdout,stderr)
+        if action == "release":
+            confirmed_tx(dep["rpc_url"], interrupted["signature"])
+            with sqlite3.connect(directory/"coordinator.sqlite") as db:
+                order, funding = db.execute("select order_id,local_signature from intents where action='fund'").fetchone()
+            interrupted["hide_funding"] = funding
+            cli("order","inspect",order,"--trust-file",directory/"trust.json","--json")
+            with sqlite3.connect(directory/"coordinator.sqlite") as db:
+                assert db.execute("select count(*) from receipts").fetchone()[0] == 0
+                assert db.execute("select count(*) from audit_events where event_type='reconciliation_gap'").fetchone()[0] >= 1
+            del interrupted["hide_funding"]
         result = recovered(action, directory, private, dep, interrupted["signature"])
     save(public/("recovery-"+action+".json"),result)
     print("VALIDATOR_RECOVERY "+json.dumps(result,separators=(",",":")),flush=True)
@@ -222,8 +247,13 @@ def recovered(action, directory, private, dep, accepted_signature):
         return int(rpc(dep["rpc_url"],"getTokenAccountBalance",[str(account),{"commitment":"finalized"}])["value"]["amount"])
     snapshots=[]
     for _ in range(2):
-        view=json.loads(cli("order","inspect",order,"--trust-file",directory/"trust.json","--json").stdout)
-        assert view["state"]==("Funded" if action=="fund" else "Paid"),view
+        for attempt in range(24):
+            view=json.loads(cli("order","inspect",order,"--trust-file",directory/"trust.json","--json").stdout)
+            if view["state"]==("Funded" if action=="fund" else "Paid"):
+                break
+            time.sleep(1)
+        else:
+            raise AssertionError(view)
         with sqlite3.connect(directory/"coordinator.sqlite") as db:
             receipts=db.execute("select count(*) from receipts").fetchone()[0]
             assert db.execute("select count(*) from intents where action=? and state='finalized_success'",(action,)).fetchone()[0]==1

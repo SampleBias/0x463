@@ -149,6 +149,16 @@ impl Chain {
         let (action, inputs) = inputs(s, db, order, v, false).await?;
         let expected = inputs.expected(self, action, false)?;
         let draft = chain_call(|| self.rpc.prepare(&expected))?;
+        let message = STANDARD
+            .decode(&draft.message)
+            .map_err(|_| ApiError::link())?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO solana_preparations
+             (order_id,action,message_digest,context_slot,last_valid_block_height) VALUES(?,?,?,?,?)",
+        )
+        .bind(order).bind(action.name()).bind(digest(&message))
+        .bind(draft.context_slot.to_string()).bind(draft.last_valid_block_height.to_string())
+        .execute(&mut *db).await?;
         json_bytes(json!({
             "context_slot": draft.context_slot.to_string(),
             "message": draft.message,
@@ -178,13 +188,15 @@ impl Chain {
             .decode(&signed.wire)
             .map_err(|_| ApiError::bad("BAD_ENCODING"))?;
         if let Some(old) =
-            sqlx::query("SELECT order_id,action,signed_bytes FROM intents WHERE intent_id=?")
+            sqlx::query("SELECT order_id,action,signed_bytes,context_slot,last_valid_block_height FROM intents WHERE intent_id=?")
                 .bind(&id)
                 .fetch_optional(&mut *db)
                 .await?
         {
             let same = old.get::<String, _>("order_id") == order
                 && old.get::<String, _>("action") == name
+                && old.get::<Option<String>, _>("context_slot") == Some(signed.context_slot.to_string())
+                && old.get::<Option<String>, _>("last_valid_block_height") == Some(signed.last_valid_block_height.to_string())
                 && old.get::<Vec<u8>, _>("signed_bytes") == raw;
             return if same {
                 Ok(id)
@@ -197,6 +209,16 @@ impl Chain {
         expected
             .validate_signed(&signed)
             .map_err(|_| ApiError::auth())?;
+        let message = signed.message_bytes().map_err(|_| ApiError::link())?;
+        consume_preparation(
+            db,
+            order,
+            name,
+            &message,
+            signed.context_slot,
+            signed.last_valid_block_height,
+        )
+        .await?;
         let delivery = inputs.delivery.as_ref().map(|m| hex_string(m.id()));
         let verdict = inputs.verdict.as_ref().map(|m| hex_string(m.id()));
         let rows = sqlx::query(
@@ -275,24 +297,20 @@ impl Chain {
             Err(error) => return Err(error),
         };
         if resolution.outcome == ChainOutcome::FinalizedSuccess {
-            if let Err(error) = self
-                .finalize(s, &mut db, &row, &inputs, kind, &resolution)
+            let mut projection = db.begin().await?;
+            match self
+                .finalize(s, &mut projection, &row, &inputs, kind, &resolution)
                 .await
             {
-                if error.1 != "LEDGER_UNAVAILABLE" {
-                    return Err(error);
+                Ok(()) => projection.commit().await?,
+                Err(error) if error.1 == "LEDGER_UNAVAILABLE" => {
+                    projection.rollback().await?;
+                    defer_for_history(s, &mut db, &row, "missing preceding finalized transaction")
+                        .await?;
+                    db.commit().await?;
+                    return Ok(());
                 }
-                db.rollback().await?;
-                let mut audit = s.pool.begin_with("BEGIN IMMEDIATE").await?;
-                gap(
-                    s,
-                    &mut audit,
-                    &order,
-                    "missing preceding finalized transaction",
-                )
-                .await?;
-                audit.commit().await?;
-                return Err(error);
+                Err(error) => return Err(error),
             }
         } else if matches!(
             resolution.outcome,
@@ -317,14 +335,13 @@ impl Chain {
             if chain_call(|| self.rpc.inspect(&expected))?
                 .is_some_and(|v| matches!(v.state, OrderState::Paid | OrderState::Refunded))
             {
-                gap(
+                defer_for_history(
                     s,
                     &mut db,
-                    &order,
+                    &row,
                     "terminal escrow observed while submitted signature is unproven",
                 )
                 .await?;
-                retry(&mut db, &row, "unknown", Some("RECONCILIATION_GAP")).await?;
                 db.commit().await?;
                 return Ok(());
             }
@@ -605,8 +622,8 @@ impl Chain {
         )
         .bind(&id).bind(order).bind(kind.name()).bind(&sig).bind(&delivery).bind(&view.verdict_id)
         .execute(&mut *db).await?;
-        let row = sqlx::query("SELECT * FROM intents WHERE intent_id=?")
-            .bind(&id)
+        let row = sqlx::query("SELECT * FROM intents WHERE intent_id=? AND order_id=? AND action=? AND local_signature=?")
+            .bind(&id).bind(order).bind(kind.name()).bind(&sig)
             .fetch_one(&mut *db)
             .await?;
         match self.finalize(s, db, &row, &e, kind, &res).await {
@@ -616,6 +633,33 @@ impl Chain {
             other => other,
         }
     }
+}
+// Solana signatures cover the message and its blockhash. The RPC context slot and expiry height
+// are outside those bytes and must match what this coordinator obtained at preparation.
+pub(super) async fn consume_preparation(
+    db: &mut Conn,
+    order: &str,
+    action: &str,
+    message: &[u8],
+    slot: u64,
+    height: u64,
+) -> Result<()> {
+    let consumed = sqlx::query(
+        "DELETE FROM solana_preparations WHERE order_id=? AND action=? AND message_digest=?
+         AND context_slot=? AND last_valid_block_height=?",
+    )
+    .bind(order)
+    .bind(action)
+    .bind(digest(message))
+    .bind(slot.to_string())
+    .bind(height.to_string())
+    .execute(db)
+    .await?
+    .rows_affected();
+    if consumed != 1 {
+        return Err(ApiError::link());
+    }
+    Ok(())
 }
 // One external transaction may settle several orders in separate instructions.
 fn observed_intent_id(order: &str, action: ChainAction, signature: &str) -> Result<String> {
@@ -640,6 +684,15 @@ async fn gap(s: &State, db: &mut Conn, order: &str, reason: &str) -> Result<()> 
         .await?;
     }
     Ok(())
+}
+pub(super) async fn defer_for_history(
+    s: &State,
+    db: &mut Conn,
+    intent: &sqlx::sqlite::SqliteRow,
+    reason: &str,
+) -> Result<()> {
+    gap(s, db, intent.get("order_id"), reason).await?;
+    retry(db, intent, "unknown", Some("RECONCILIATION_GAP")).await
 }
 async fn retry(
     db: &mut Conn,
@@ -678,13 +731,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn one_external_transaction_can_settle_multiple_orders() {
+    fn external_intent_id_distinguishes_orders_and_actions_sharing_a_signature() {
         let sig = bs58::encode([7; 64]).into_string();
         let first = "01".repeat(32);
         let second = "02".repeat(32);
         let refund = |order: &str| observed_intent_id(order, ChainAction::Refund, &sig).unwrap();
         assert_ne!(refund(&first), refund(&second));
-        assert_ne!(refund(&first), observed_intent_id(&first, ChainAction::Release, &sig).unwrap());
+        assert_ne!(
+            refund(&first),
+            observed_intent_id(&first, ChainAction::Release, &sig).unwrap()
+        );
         assert_ne!(refund(&first), digest(sig.as_bytes()));
     }
 }

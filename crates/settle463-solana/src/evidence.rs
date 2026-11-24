@@ -126,12 +126,15 @@ impl Expected {
     }
     // A permissionless refund may accompany unrelated instructions. Tie the transfer to the
     // escrow invocation itself and verify the complete net beneficiary and vault changes.
-    fn external_refund(&self, msg: &Message) -> Result<usize> {
+    pub(crate) fn external_refund(&self, msg: &Message) -> Result<usize> {
         let required = self.escrow_ix(msg.account_keys[0])?;
+        let escrow = key(&self.terms.escrow_account)?;
         let mut index = None;
         for (i, c) in msg.instructions.iter().enumerate() {
             let actual = decoded_ix(msg, c)?;
-            if actual.program_id == required.program_id {
+            if actual.program_id == required.program_id
+                && actual.accounts.iter().any(|a| a.pubkey == escrow)
+            {
                 ensure(
                     index.is_none()
                         && actual.data == required.data
@@ -412,6 +415,7 @@ impl Rpc {
         stored: Option<&SignedTx>,
     ) -> Result<Resolution> {
         base58::<64>(signature).map_err(invalid)?;
+        ensure(self.deployment == e.deployment, "RPC deployment")?;
         self.validate_deployment()?;
         if let Some(tx) = stored {
             ensure(tx.signature == signature, "stored signature mismatch")?;
@@ -419,7 +423,7 @@ impl Rpc {
         }
         let v=self.call("getTransaction",json!([signature,{"encoding":"base64","commitment":"finalized","maxSupportedTransactionVersion":0}]))?;
         if v.is_null() {
-            return self.missing(e, signature, stored);
+            return self.missing(signature, stored);
         }
         let slot = v["slot"]
             .as_u64()
@@ -472,48 +476,79 @@ impl Rpc {
             known_terminal: None,
         })
     }
-    /// A null transaction lookup alone cannot rule out a gap in RPC history. Follow
-    /// finalized parent links to the block that supplied the signed recent blockhash.
-    fn proved_absent(
-        &self,
-        signature: &str,
-        hash: &str,
-        mut slot: u64,
-        context: u64,
-    ) -> Result<bool> {
-        if slot < context || slot - context > 1024 {
+    /// Check finalized produced blocks from the issuance block through the first
+    /// successor of its validity window. Skipped slots and restart age do not extend the scan.
+    fn proved_absent(&self, tx: &SignedTx, hash: &str, tip: u64) -> Result<bool> {
+        // Agave 4.1.2 uses solana_clock::MAX_PROCESSING_AGE for each recent blockhash.
+        const PROCESSING_AGE: u64 = 150;
+        const WINDOW_BLOCKS: u64 = PROCESSING_AGE + 2;
+        let slots = self.call(
+            "getBlocksWithLimit",
+            json!([tx.context_slot, WINDOW_BLOCKS, {"commitment":"finalized"}]),
+        )?;
+        let Some(slots) = slots.as_array() else {
+            return Ok(false);
+        };
+        if slots.len() != WINDOW_BLOCKS as usize
+            || slots.first().and_then(Value::as_u64) != Some(tx.context_slot)
+            || slots.last().and_then(Value::as_u64).is_none_or(|s| s > tip)
+        {
             return Ok(false);
         }
-        let mut required_hash = None;
-        for _ in 0..=1024 {
-            let block=self.call("getBlock",json!([slot,{"commitment":"finalized","transactionDetails":"signatures","rewards":false,"maxSupportedTransactionVersion":0}]))?;
-            let (Some(block_hash), Some(previous), Some(parent), Some(signatures)) = (
+        let mut previous = None::<(u64, String, u64)>;
+        for number in slots {
+            let Some(slot) = number.as_u64() else {
+                return Ok(false);
+            };
+            let block = self.call(
+                "getBlock",
+                json!([slot, {
+                    "commitment":"finalized", "transactionDetails":"signatures", "rewards":false,
+                    "maxSupportedTransactionVersion":0
+                }]),
+            )?;
+            let (
+                Some(block_hash),
+                Some(parent_hash),
+                Some(parent_slot),
+                Some(height),
+                Some(signatures),
+            ) = (
                 block["blockhash"].as_str(),
                 block["previousBlockhash"].as_str(),
                 block["parentSlot"].as_u64(),
+                block["blockHeight"].as_u64(),
                 block["signatures"].as_array(),
-            ) else {
+            )
+            else {
                 return Ok(false);
             };
-            if required_hash.as_deref().is_some_and(|h| h != block_hash)
-                || signatures
-                    .iter()
-                    .any(|s| s.as_str().is_none_or(|s| s == signature))
+            if let Some((last_slot, last_hash, last_height)) = previous {
+                if parent_slot != last_slot
+                    || parent_hash != last_hash
+                    || slot <= last_slot
+                    || last_height.checked_add(1) != Some(height)
+                {
+                    return Ok(false);
+                }
+            } else if block_hash != hash
+                || height.checked_add(PROCESSING_AGE) != Some(tx.last_valid_block_height)
+            {
+                return Err(invalid(
+                    "prepare metadata disagrees with finalized blockhash issuance",
+                ));
+            }
+            if signatures
+                .iter()
+                .any(|s| s.as_str().is_none_or(|s| s == tx.signature))
             {
                 return Ok(false);
             }
-            if block_hash == hash {
-                return Ok(slot <= context);
-            }
-            if slot == 0 || parent >= slot || slot < context {
-                return Ok(false);
-            }
-            required_hash = Some(previous.to_owned());
-            slot = parent;
+            previous = Some((slot, block_hash.to_owned(), height));
         }
-        Ok(false)
+        Ok(true)
     }
-    fn missing(&self, e: &Expected, sig: &str, stored: Option<&SignedTx>) -> Result<Resolution> {
+    fn missing(&self, sig: &str, stored: Option<&SignedTx>) -> Result<Resolution> {
         let s = self.call(
             "getSignatureStatuses",
             json!([[sig],{"searchTransactionHistory":true}]),
@@ -536,46 +571,22 @@ impl Rpc {
             return Ok(Resolution::status(ChainOutcome::Unknown));
         };
         let (msg, _) = decode_wire(&tx.wire)?;
-        let h = self
-            .call("getBlockHeight", json!([{"commitment":"finalized"}]))?
-            .as_u64()
-            .ok_or_else(|| invalid("finalized block height"))?;
-        if h <= tx.last_valid_block_height {
-            return Ok(Resolution::status(ChainOutcome::Unknown));
-        }
+        let hash = msg.recent_blockhash.to_string();
         let valid = self.call(
             "isBlockhashValid",
-            json!([msg.recent_blockhash.to_string(),{"commitment":"finalized"}]),
+            json!([hash, {"commitment":"finalized"}]),
         )?;
+        let Some(tip) = valid["context"]["slot"].as_u64() else {
+            return Ok(Resolution::status(ChainOutcome::Unknown));
+        };
+        if valid["value"] != false || tip < tx.context_slot {
+            return Ok(Resolution::status(ChainOutcome::Unknown));
+        }
         let earliest = self
             .call("getFirstAvailableBlock", json!([]))?
             .as_u64()
             .ok_or_else(|| invalid("ledger history bound"))?;
-        if valid["value"] != false || earliest > tx.context_slot {
-            return Ok(Resolution::status(ChainOutcome::Unknown));
-        }
-        let state = self.escrow_at(e, tx.context_slot)?;
-        let absent = matches!(
-            (e.action, state.as_ref().map(|v| v.state)),
-            (ChainAction::Fund, None)
-                | (ChainAction::CommitDelivery, Some(OrderState::Funded))
-                | (ChainAction::Release, Some(OrderState::Delivered))
-                | (
-                    ChainAction::Refund,
-                    Some(OrderState::Funded | OrderState::Delivered)
-                )
-        );
-        let tip = valid["context"]["slot"].as_u64();
-        let absent = if let Some(slot) = tip.filter(|_| absent) {
-            self.proved_absent(
-                sig,
-                &msg.recent_blockhash.to_string(),
-                slot,
-                tx.context_slot,
-            )?
-        } else {
-            false
-        };
+        let absent = earliest <= tx.context_slot && self.proved_absent(tx, &hash, tip)?;
         Ok(Resolution::status(if absent {
             ChainOutcome::Expired
         } else {

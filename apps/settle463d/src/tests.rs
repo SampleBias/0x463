@@ -534,6 +534,95 @@ async fn staged_signed_funding_recovers_and_retries_without_another_debit() {
 }
 
 #[tokio::test]
+async fn missing_finalized_history_keeps_the_intent_retryable_with_one_gap_observation() {
+    let (_dir, s) = server().await;
+    accepted(&s).await;
+    let mut tx = s.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let id = "12".repeat(32);
+    sqlx::query(
+        "INSERT INTO intents(intent_id,order_id,action,state,signed_bytes,local_signature)
+         VALUES(?,?,'release','submitted',x'0102','original')",
+    )
+    .bind(&id)
+    .bind(ORDER)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO outbox(intent_id,available_at) VALUES(?,'0')")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let before_retry = http::now().unwrap();
+    for _ in 0..2 {
+        let mut tx = s.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let row = sqlx::query("SELECT * FROM intents WHERE intent_id=?")
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        chain::defer_for_history(&s, &mut tx, &row, "missing preceding finalized transaction")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let mut db = s.pool.acquire().await.unwrap();
+    let stats: (i64, i64, i64, String, Vec<u8>) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM receipts),
+            (SELECT COUNT(*) FROM audit_events WHERE event_type='reconciliation_gap'),
+            outbox.attempts,outbox.last_error,intents.signed_bytes
+         FROM outbox JOIN intents USING(intent_id)
+         WHERE intent_id=? AND intents.state='unknown' AND CAST(outbox.available_at AS INTEGER)>=?",
+    )
+    .bind(&id)
+    .bind(before_retry + 2)
+    .fetch_one(&mut *db)
+    .await
+    .unwrap();
+    assert_eq!(stats, (0, 1, 2, "RECONCILIATION_GAP".into(), vec![1, 2]));
+    let status: Value =
+        serde_json::from_slice(&actions::status(&mut db, ORDER, &id).await.unwrap()).unwrap();
+    assert_eq!(status["outcome"], "unknown");
+}
+
+#[tokio::test]
+async fn submitted_validity_metadata_must_match_the_prepared_message_and_order() {
+    let (_dir, s) = server().await;
+    accepted(&s).await;
+    let mut db = s.pool.acquire().await.unwrap();
+    let message = b"prepared message";
+    sqlx::query("INSERT INTO solana_preparations VALUES(?,'fund',?,'12','180')")
+        .bind(ORDER)
+        .bind(digest(message))
+        .execute(&mut *db)
+        .await
+        .unwrap();
+    for (order, action, bytes, slot, height) in [
+        (ORDER, "fund", message.as_slice(), 13, 180),
+        (ORDER, "fund", message.as_slice(), 12, u64::MAX),
+        (ORDER, "fund", b"other".as_slice(), 12, 180),
+        (ORDER, "refund", message.as_slice(), 12, 180),
+        ("other", "fund", message.as_slice(), 12, 180),
+    ] {
+        assert!(
+            chain::consume_preparation(&mut db, order, action, bytes, slot, height)
+                .await
+                .is_err()
+        );
+    }
+    chain::consume_preparation(&mut db, ORDER, "fund", message, 12, 180)
+        .await
+        .unwrap();
+    assert!(
+        chain::consume_preparation(&mut db, ORDER, "fund", message, 12, 180)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn sticky_verdict_pays_once_and_exports_one_signed_receipt() {
     let (_dir, s) = server().await;
     accepted(&s).await;

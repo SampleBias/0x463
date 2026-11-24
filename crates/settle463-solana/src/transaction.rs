@@ -49,6 +49,12 @@ pub struct SignedTx {
     pub last_valid_block_height: u64,
     pub context_slot: u64,
 }
+impl SignedTx {
+    pub fn message_bytes(&self) -> Result<Vec<u8>> {
+        let (message, _) = decode_wire(&self.wire)?;
+        Ok(message.serialize())
+    }
+}
 fn ro(key: Pubkey) -> Meta {
     Meta::new_readonly(key, false)
 }

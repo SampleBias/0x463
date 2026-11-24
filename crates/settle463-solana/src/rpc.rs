@@ -30,6 +30,16 @@ impl Transport for Http {
             return Err(err(&"response size limit"));
         }
         let v: Value = serde_json::from_slice(&bytes).map_err(|e| err(&e))?;
+        if v["jsonrpc"] == "2.0"
+            && v["id"] == 1
+            && matches!(method, "getBlock" | "getBlocksWithLimit")
+            && matches!(
+                v["error"]["code"].as_i64(),
+                Some(-32001 | -32004 | -32007 | -32009 | -32011 | -32014)
+            )
+        {
+            return Ok(Value::Null);
+        }
         if v["jsonrpc"] != "2.0" || v["id"] != 1 || v.get("error").is_some() {
             return Err(err(&v["error"]));
         }
