@@ -1,0 +1,30 @@
+name: Phase A toolchain spike
+on:
+  push:
+    branches: [build/phase-a0-spike]
+permissions:
+  contents: read
+jobs:
+  spike:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install Anchor 0.32.1 and Agave 2.3.0
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl --fail --location --retry 3 --output anchor https://github.com/solana-foundation/anchor/releases/download/v0.32.1/anchor-0.32.1-x86_64-unknown-linux-gnu
+          curl --fail --location --retry 3 --output agave.tar.bz2 https://github.com/anza-xyz/agave/releases/download/v2.3.0/solana-release-x86_64-unknown-linux-gnu.tar.bz2
+          echo '5f25b850ce80278507a98947833fcd48423391f6d145046ffb0c5fd130dec436  anchor' | sha256sum --check
+          echo '56241fbe862495ff01b2b875195e44f94c22e9f2a504591a3ade1b9d82862730  agave.tar.bz2' | sha256sum --check
+          install -Dm755 anchor "$RUNNER_TEMP/anchor-bin/anchor"
+          tar -xjf agave.tar.bz2
+          echo "$RUNNER_TEMP/anchor-bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/solana-release/bin" >> "$GITHUB_PATH"
+      - name: Build, deploy and invoke on the local validator
+        run: |
+          rustc -Vv
+          cargo -V
+          bash scripts/phase-a0-spike.sh
