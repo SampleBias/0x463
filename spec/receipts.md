@@ -48,6 +48,8 @@ Simulator `ledger`:
 
 Solana `ledger` includes `ledger_kind` `solana`, genesis base58, program id, config, order PDA, mint, atomic amount, beneficiary, vault, funding signature, optional delivery signature, terminal signature, terminal instruction name (`release` or `refund`), finalized slot as a decimal string, and `evidence_digest`. The digest is SHA-256 of the JCS ledger object with `evidence_digest` removed.
 
+Each local-validator bundle carries `"asset_label": "local validator test asset"` in its ledger evidence. The signed asset ID and the CLI's `asset` field both contain the generated mint address.
+
 The JSON field names are `genesis`, `program_id`, `config`, `order_pda`, `mint`, `amount`, `beneficiary`, `vault`, `funding_signature`, `delivery_signature`, `terminal_signature`, `terminal_instruction`, and `finalized_slot`. The amount is an unsigned decimal string in mint atomic units. The receipt's `terminal_locator` is the terminal transaction signature. The verifier reads the RPC endpoint from the caller's `--rpc` argument and ignores a top-level `rpc_url` hint. A finalized transaction may omit `blockTime`. The escrow program enforces deadlines using the Clock sysvar during execution.
 
 ## Verification modes

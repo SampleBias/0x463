@@ -3,7 +3,7 @@ import argparse
 import base64
 import hashlib
 import signal
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -18,6 +18,7 @@ from threading import Event, Thread
 from urllib.request import Request, ProxyHandler, build_opener
 from solders.transaction import Transaction
 import time
+import traceback
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]/"scripts"))
 from validator_fixture import ATA, SYSTEM, TOKEN, AccountMeta, Instruction, Keypair, Pubkey, associated, key, rpc, submit, transfer, TransferParams
@@ -84,11 +85,14 @@ def verify(session, url, code=0):
 
 
 @contextmanager
-def proxy_rpc(url, transform):
+def proxy_rpc(url, transform, before_forward=None):
     class Proxy(BaseHTTPRequestHandler):
         def do_POST(self):
             raw = self.rfile.read(int(self.headers["Content-Length"]))
             req = json.loads(raw)
+            if before_forward and not before_forward(req["method"], req.get("params", [])):
+                self.close_connection = True
+                return
             upstream = Request(url, data=raw, headers={"Content-Type": "application/json"})
             with build_opener(ProxyHandler({})).open(upstream, timeout=15) as response:
                 reply = json.load(response)
@@ -145,6 +149,8 @@ def demo(case, private, dep, public):
     off=cli("receipt","verify",session/"receipt.json","--offline","--trust-file",session/"trust.json")
     assert off.stdout.strip()=="evidence_signed"
     ledger=bundle["ledger"]; quote=bundle["quote"]["body"]["settlement"]; url=dep["rpc_url"]
+    assert ledger["asset_label"] == "local validator test asset"
+    assert f'local validator test asset mint={dep["mint"]}' in run.stderr
     txs={k:confirmed_tx(url,ledger[k]) for k in ("funding_signature","delivery_signature","terminal_signature") if k in ledger}
     assert str(txs["terminal_signature"]["slot"])==ledger["finalized_slot"]
     vault=rpc(url,"getTokenAccountBalance",[ledger["vault"],{"commitment":"finalized"}])["value"]["amount"]
@@ -186,42 +192,49 @@ def demo(case, private, dep, public):
     print("VALIDATOR_CASE "+json.dumps(info,separators=(",",":")),flush=True)
 
 
-def recovery(action, private, dep, public):
+def recovery(action, private, dep, public, *, before_broadcast=False):
     directory = private/"interrupted"
     discriminator = hashlib.sha256(("global:"+action).encode()).digest()[:8]
     program = Pubkey.from_string(dep["program_id"])
     lost = Event()
     interrupted = {}
 
-    def lose_response(method, params, reply):
-        if method == "getTransaction" and params[0] == interrupted.get("hide_funding"):
-            reply["result"] = None
-        if action == "release" and method == "getTransaction" and reply.get("result"):
-            reply["result"]["blockTime"] = None
-        if method != "sendTransaction" or "result" not in reply or lost.is_set():
+    def interrupt(method, params, accepted=None):
+        if method != "sendTransaction" or lost.is_set():
             return True
         tx = Transaction.from_bytes(base64.b64decode(params[0]))
         if not any(tx.message.account_keys[ix.program_id_index] == program and
                    bytes(ix.data).startswith(discriminator) for ix in tx.message.instructions):
             return True
-        assert str(tx.signatures[0]) == reply["result"]
-        # The validator has accepted the transaction. Stop this demo's daemon before replying over HTTP.
+        signature = str(tx.signatures[0])
+        if accepted is not None:
+            assert signature == accepted
         children = Path(f"/proc/{process.pid}/task/{process.pid}/children").read_text().split()
-        servers = [int(c) for c in children if b"__serve" in Path(f"/proc/{c}/cmdline").read_bytes().split(bytes(1))]
+        servers = [int(c) for c in children if b"__serve" in Path(f"/proc/{c}/cmdline").read_bytes().split(b"\x00")]
         assert len(servers) == 1, servers
-        interrupted["signature"] = reply["result"]
+        interrupted["signature"] = signature
         os.kill(servers[0], signal.SIGKILL)
         lost.set()
         return False
 
-    with proxy_rpc(dep["rpc_url"], lose_response) as proxy:
+    def lose_response(method, params, reply):
+        if method == "getTransaction" and params[0] == interrupted.get("hide_funding"):
+            reply["result"] = None
+        if action == "release" and method == "getTransaction" and reply.get("result"):
+            reply["result"]["blockTime"] = None
+        return before_broadcast or "result" not in reply or interrupt(method, params, reply["result"])
+
+    with proxy_rpc(dep["rpc_url"], lose_response, interrupt if before_broadcast else None) as proxy:
         save(private/"deployment.json", {**dep, "rpc_url": proxy})
         with subprocess.Popen([str(CLI), "demo", "--scenario", "pass", "--backend", "local-validator",
                                "--deployment", str(private/"deployment.json"), "--output-dir", str(directory)],
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
             stdout, stderr = process.communicate(timeout=250)
             assert lost.is_set() and process.returncode != 0, (action,stdout,stderr)
-        if action == "release":
+        if before_broadcast:
+            assert rpc(dep["rpc_url"], "getSignatureStatuses", [[interrupted["signature"]],
+                       {"searchTransactionHistory": True}])["value"] == [None]
+        elif action == "release":
             confirmed_tx(dep["rpc_url"], interrupted["signature"])
             with sqlite3.connect(directory/"coordinator.sqlite") as db:
                 order, funding = db.execute("select order_id,local_signature from intents where action='fund'").fetchone()
@@ -231,17 +244,20 @@ def recovery(action, private, dep, public):
                 assert db.execute("select count(*) from receipts").fetchone()[0] == 0
                 assert db.execute("select count(*) from audit_events where event_type='reconciliation_gap'").fetchone()[0] >= 1
             del interrupted["hide_funding"]
-        result = recovered(action, directory, private, dep, interrupted["signature"])
-    save(public/("recovery-"+action+".json"),result)
+        result = recovered(action, directory, private, dep, interrupted["signature"], before_broadcast)
+    result["interruption"] = "before_broadcast" if before_broadcast else "lost_response"
+    save(public/("recovery-"+result["interruption"]+"-"+action+".json"),result)
     print("VALIDATOR_RECOVERY "+json.dumps(result,separators=(",",":")),flush=True)
 
 
-def recovered(action, directory, private, dep, accepted_signature):
+def recovered(action, directory, private, dep, accepted_signature, before_broadcast):
     trust=json.loads((directory/"trust.json").read_bytes());order=trust["trusted_order"]
     with sqlite3.connect(directory/"coordinator.sqlite") as db:
         sig,raw=db.execute("select local_signature,signed_bytes from intents where action=? and order_id=?",(action,order)).fetchone()
         assert sig==accepted_signature and len(raw)>64 and db.execute("select count(*) from receipts").fetchone()[0]==0
-    tx=confirmed_tx(dep["rpc_url"],sig); buyer=associated(key(private,"buyer").pubkey(),Pubkey.from_string(dep["mint"]))
+    if not before_broadcast:
+        confirmed_tx(dep["rpc_url"],sig)
+    buyer=associated(key(private,"buyer").pubkey(),Pubkey.from_string(dep["mint"]))
     seller=associated(key(private,"seller").pubkey(),Pubkey.from_string(dep["mint"]))
     def balance(account):
         return int(rpc(dep["rpc_url"],"getTokenAccountBalance",[str(account),{"commitment":"finalized"}])["value"]["amount"])
@@ -262,7 +278,8 @@ def recovered(action, directory, private, dep, accepted_signature):
         snapshots.append([balance(buyer),balance(seller),int(view["held"]),receipts])
     assert snapshots==[[3000000,0,2000000,0] if action=="fund" else [3000000,2000000,0,1]]*2
     if action=="release": verify(directory,dep["rpc_url"])
-    return dict(action=action,signature=sig,slot=tx["slot"],order_id=order,restart_snapshots=snapshots)
+    slot=confirmed_tx(dep["rpc_url"],sig)["slot"]
+    return dict(action=action,signature=sig,slot=slot,order_id=order,restart_snapshots=snapshots)
 
 
 def main():
@@ -270,8 +287,8 @@ def main():
     public=parser.parse_args().output.resolve();public.mkdir(parents=True)
     fixture=Path(os.environ["PHASE_D_FIXTURE"]);dep=json.loads((fixture/"deployment.json").read_bytes())
     save(public/"deployment.json",dep)
-    commands=[*CASES,"recover-fund","recover-release","adapter-recovery"]
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    commands=[*CASES,"recover-fund","recover-release","before-release","adapter-recovery"]
+    with ThreadPoolExecutor(max_workers=len(commands)+1) as pool:
         def run(name):
             private=new_parties(fixture,name,dep)
             if name == "adapter-recovery":
@@ -279,11 +296,22 @@ def main():
                                 "--test", "validator_recovery", "--", "--ignored", "--nocapture"],
                                env=dict(os.environ,PHASE_D_ADAPTER_FIXTURE=str(private)),check=True)
             elif name in CASES: demo(name,private,dep,public)
+            elif name == "before-release": recovery("release",private,dep,public,before_broadcast=True)
             else: recovery(name.removeprefix("recover-"),private,dep,public)
-        futures=[pool.submit(run,name) for name in commands]
+        tasks={pool.submit(run,name): name for name in commands}
         program=pool.submit(subprocess.run,[sys.executable,"programs/settle463-escrow/tests/validator.py",
                   fixture/"deployment.json",fixture,"--out",public/"program-tests.json"],check=True)
-        for f in [*futures,program]: f.result()
+        tasks[program] = "escrow program"
+        failures = []
+        for task in as_completed(tasks):
+            try:
+                task.result()
+            except Exception as error:
+                failures.append(tasks[task])
+                print(f"Validator case failed: {tasks[task]}", file=sys.stderr, flush=True)
+                traceback.print_exception(error)
+        if failures:
+            raise RuntimeError("failed validator cases: " + ", ".join(failures))
     print("VALIDATOR_PROGRAM "+json.dumps(json.loads((public/"program-tests.json").read_text()),separators=(",",":")),flush=True)
 
 

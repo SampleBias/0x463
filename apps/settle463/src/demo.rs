@@ -51,6 +51,11 @@ pub fn run(scenario: &str, dir: &Path, deployment: Option<&Path>) -> AnyResult<V
     let issuer = key("coordinator")?;
     let (env, start, asset, deadlines) = if let Some(v) = &validator {
         let start = v.rpc.clock()?;
+        eprintln!(
+            "{} mint={}",
+            settle463_core::receipt::SolanaLedger::LOCAL_ASSET_LABEL,
+            v.deployment.mint
+        );
         (
             v.deployment.environment(),
             start,

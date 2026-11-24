@@ -346,13 +346,6 @@ impl Chain {
                 return Ok(());
             }
             let sent = chain_call(|| self.rpc.broadcast(&signed)).is_ok();
-            #[cfg(debug_assertions)]
-            if sent
-                && std::env::var("SETTLE463_TEST_STOP").as_deref()
-                    == Ok(format!("after_broadcast:{name}").as_str())
-            {
-                std::process::exit(87);
-            }
             let status =
                 if resolution.outcome == ChainOutcome::Pending || (sent && state == "prepared") {
                     "submitted"
@@ -529,6 +522,7 @@ impl Chain {
         let paid = view.state == OrderState::Paid;
         Ok(SolanaLedger {
             ledger_kind: "solana".into(),
+            asset_label: SolanaLedger::LOCAL_ASSET_LABEL.into(),
             genesis: self.deployment.genesis.clone(),
             program_id: self.deployment.program_id.clone(),
             config: self.deployment.config.clone(),

@@ -5,6 +5,7 @@ use crate::{artifact::digest, ident::base58, wire::Settlement};
 #[serde(deny_unknown_fields)]
 pub struct SolanaLedger {
     pub ledger_kind: String,
+    pub asset_label: String,
     pub genesis: String,
     pub program_id: String,
     pub config: String,
@@ -23,6 +24,8 @@ pub struct SolanaLedger {
 }
 
 impl SolanaLedger {
+    pub const LOCAL_ASSET_LABEL: &'static str = "local validator test asset";
+
     fn digest(&self) -> Result<String, ReceiptError> {
         let mut value = serde_json::to_value(self).map_err(|_| InvalidEvidence)?;
         value
@@ -62,6 +65,7 @@ impl SolanaLedger {
             "refund"
         };
         if self.ledger_kind != "solana"
+            || self.asset_label != Self::LOCAL_ASSET_LABEL
             || self.evidence_digest != self.digest()?
             || self.program_id != *program_id
             || self.config != *config
