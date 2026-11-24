@@ -298,10 +298,14 @@ fn verdict(v: &Verdict) -> Result<()> {
         (None, None) => false,
         _ => return Err(Error::Invalid("incomplete observations")),
     };
-    let mut indeterminate = false;
     for code in &v.reason_codes {
         match code.as_str() {
-            "UNAVAILABLE" | "DEADLINE_EXPIRED" => indeterminate = true,
+            "UNAVAILABLE" | "DEADLINE_EXPIRED" => {
+                return require(
+                    v.decision == "INDETERMINATE" && v.reason_codes.len() == 1,
+                    "indeterminate verdict",
+                );
+            }
             "MATCH" => {
                 return require(
                     v.decision == "PASS" && v.reason_codes.len() == 1 && observed,
@@ -309,20 +313,14 @@ fn verdict(v: &Verdict) -> Result<()> {
                 )
             }
             "DIGEST_MISMATCH" | "SIZE_MISMATCH" | "SCHEMA_MISMATCH" | "FIELD_TYPE"
-            | "MALFORMED_JSON" | "DUPLICATE_FIELD" | "OVERSIZED" | "TOO_MANY_FIELDS"
-            | "FIELD_LENGTH" => require(observed, "missing artifact observations")?,
-            "UNSUPPORTED_PROFILE" => (),
+            | "MALFORMED_JSON" | "DUPLICATE_FIELD" | "TOO_MANY_FIELDS" | "FIELD_LENGTH" => {
+                require(observed, "missing artifact observations")?
+            }
+            "OVERSIZED" | "UNSUPPORTED_PROFILE" => (),
             _ => return Err(Error::Invalid("unknown reason code")),
         }
     }
-    require(
-        if indeterminate {
-            v.decision == "INDETERMINATE"
-        } else {
-            v.decision == "FAIL"
-        },
-        "verdict decision",
-    )
+    require(v.decision == "FAIL", "verdict decision")
 }
 
 fn locator(s: &str, env: &str, order: &str) -> Result<()> {

@@ -106,5 +106,14 @@ fn byte_comparison_requires_observations_even_for_failures() {
         v.decision = "INDETERMINATE".into();
         v.reason_codes = vec!["UNAVAILABLE".into()];
     }
+    sign(unsigned.clone(), &key).unwrap();
+    if let Body::Verdict(v) = &mut unsigned.payload {
+        v.reason_codes = vec!["DEADLINE_EXPIRED".into(), "UNAVAILABLE".into()];
+    }
+    assert!(sign(unsigned.clone(), &key).is_err());
+    if let Body::Verdict(v) = &mut unsigned.payload {
+        v.decision = "FAIL".into();
+        v.reason_codes = vec!["OVERSIZED".into()];
+    }
     sign(unsigned, &key).unwrap();
 }
