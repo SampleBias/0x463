@@ -101,14 +101,35 @@ pub struct Review {
 
 impl Review {
     pub fn sim_fund(agreement: &Agreement, environment: &str) -> Result<Self> {
-        let (_, q) = agreement.terms(environment)?;
-        let Settlement::Sim {
-            buyer_destination,
-            seller_destination,
-            ..
-        } = &q.settlement
-        else {
+        if !environment.starts_with("sim:") {
             return Err(FundingError::Environment);
+        }
+        Self::from_agreement(agreement, environment)
+    }
+
+    /// Signed settlement terms. The Solana adapter independently derives and checks every address.
+    pub fn from_agreement(agreement: &Agreement, environment: &str) -> Result<Self> {
+        let (_, q) = agreement.terms(environment)?;
+        let (buyer_destination, seller_destination, escrow_account) = match &q.settlement {
+            Settlement::Sim {
+                buyer_destination,
+                seller_destination,
+                ..
+            } => (
+                buyer_destination,
+                seller_destination,
+                format!("sim-escrow:{}", q.order_id),
+            ),
+            Settlement::Solana {
+                buyer_token_account,
+                seller_token_account,
+                escrow_pda,
+                ..
+            } => (
+                buyer_token_account,
+                seller_token_account,
+                escrow_pda.clone(),
+            ),
         };
         Ok(Self {
             environment: environment.to_owned(),
@@ -125,7 +146,7 @@ impl Review {
             asset: q.asset.clone(),
             buyer_destination: buyer_destination.clone(),
             seller_destination: seller_destination.clone(),
-            escrow_account: format!("sim-escrow:{}", q.order_id),
+            escrow_account,
             deadlines: q.deadlines.clone(),
         })
     }

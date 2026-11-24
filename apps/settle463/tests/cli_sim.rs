@@ -217,6 +217,7 @@ impl Peer {
         let mut admin_token = [0; 32];
         getrandom::getrandom(&mut admin_token).unwrap();
         let config = settle463d::Config {
+        deployment: None,
             database: state.0.join("db.sqlite"),
             artifact_root: state.0.join("artifacts"),
             issuer_seed_file: key_file,

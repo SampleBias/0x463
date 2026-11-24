@@ -10,6 +10,12 @@ use settle463_core::{
 };
 use sqlx::Row;
 
+pub(crate) async fn ledger_clock(s:&State, db:&mut Conn)->Result<i64>{
+    match &s.chain {
+        Some(chain)=>chain.clock(),
+        None=>clock(db).await,
+    }
+}
 pub(crate) async fn clock(db: &mut Conn) -> Result<i64> {
     let value: String = sqlx::query_scalar("SELECT clock FROM deployment")
         .fetch_one(db)
@@ -248,8 +254,8 @@ pub(crate) async fn publish(
                 acceptance: msg.clone(),
             };
             let (r, q) = agreement.terms(env)?;
-            let review = Review::sim_fund(&agreement, env)?;
-            if clock(db).await? >= timestamp(&q.deadlines.fund_by)? {
+            let review = Review::from_agreement(&agreement, env)?;
+            if ledger_clock(s,db).await? >= timestamp(&q.deadlines.fund_by)? {
                 return Err(ApiError::conflict("STATE_CONFLICT"));
             }
             let n = sqlx::query("INSERT OR IGNORE INTO acceptances VALUES(?,?,?,?,?)")
@@ -299,7 +305,7 @@ pub(crate) async fn publish(
         }
         Body::Delivery(d) => {
             let agreement = agreement(db, env, &d.order_id).await?;
-            let review = Review::sim_fund(&agreement, env)?;
+            let review = Review::from_agreement(&agreement, env)?;
             settle463_core::settlement::check_delivery(&review, msg)?;
             let row: Option<(String, String)> = sqlx::query_as(
                 "SELECT digest,length FROM artifacts WHERE content_id=? AND order_id=?",
@@ -325,7 +331,7 @@ pub(crate) async fn publish(
                 return Err(ApiError::link());
             }
             let a = agreement(db, env, &v.order_id).await?;
-            let review = Review::sim_fund(&a, env)?;
+            let review = Review::from_agreement(&a, env)?;
             let delivery = load(db, &v.delivery_id, env).await?;
             settle463_core::settlement::check_verdict(&review, &delivery, msg)?;
             let (_, q) = a.terms(env)?;
@@ -339,7 +345,7 @@ pub(crate) async fn publish(
                 return Err(ApiError::conflict("STATE_CONFLICT"));
             }
             if v.decision != "INDETERMINATE"
-                && clock(db).await? >= timestamp(&q.deadlines.resolve_by)?
+                && ledger_clock(s,db).await? >= timestamp(&q.deadlines.resolve_by)?
             {
                 return Err(ApiError::conflict("STATE_CONFLICT"));
             }
@@ -361,7 +367,7 @@ pub(crate) async fn publish(
         }
         Body::Receipt(r) => {
             let accepted = agreement(db, env, &r.order_id).await?;
-            let review = Review::sim_fund(&accepted, env)?;
+            let review = Review::from_agreement(&accepted, env)?;
             if r.receipt_issuer != review.receipt_issuer
                 || r.request_id != review.request_id
                 || r.quote_id != review.quote_id
@@ -408,8 +414,13 @@ pub(crate) async fn order_projection(s: &State, db: &mut Conn, order: &str) -> R
         .fetch_one(&mut *db)
         .await?;
     let agreement = agreement(db, &s.config.environment, order).await?;
-    let review = Review::sim_fund(&agreement, &s.config.environment)?;
-    let sim = actions::restore(s, db).await?;
+    let review = Review::from_agreement(&agreement, &s.config.environment)?;
+    let (buyer_balance,seller_balance) = if let Some(chain)=&s.chain {
+        (chain.balance(&review.buyer_destination)?,chain.balance(&review.seller_destination)?)
+    } else {
+        let sim=actions::restore(s, db).await?;
+        (sim.balance(&review.buyer_destination,&review.asset.id)?,sim.balance(&review.seller_destination,&review.asset.id)?)
+    };
     let sticky: Option<String> = row.get("definitive_id");
     let verdict = if let Some(id) = sticky {
         Some(value(db, &id).await?)
@@ -431,8 +442,8 @@ pub(crate) async fn order_projection(s: &State, db: &mut Conn, order: &str) -> R
         "verdict_id": row.get::<Option<String>,_>("verdict_id"),
         "terminal_clock": row.get::<Option<String>,_>("terminal_clock"),
         "terminal_locator": row.get::<Option<String>,_>("terminal_locator"),
-        "buyer_balance": sim.balance(&review.buyer_destination,&review.asset.id)?.to_string(),
-        "seller_balance": sim.balance(&review.seller_destination,&review.asset.id)?.to_string(),
-        "clock": clock(db).await?.to_string(),
+        "buyer_balance": buyer_balance.to_string(),
+        "seller_balance": seller_balance.to_string(),
+        "clock": ledger_clock(s,db).await?.to_string(),
     }))
 }

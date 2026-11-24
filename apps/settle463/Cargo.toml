@@ -11,3 +11,5 @@ settle463-sdk = { path = "../../crates/settle463-sdk" }
 settle463d = { path = "../settle463d" }
 serde_json = "1"
 getrandom = "0.2"
+
+settle463-solana = { path = "../../crates/settle463-solana" }

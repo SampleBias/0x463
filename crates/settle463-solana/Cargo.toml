@@ -14,8 +14,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 settle463-core = { path = "../settle463-core" }
 sha2 = "0.10"
-solana-instruction = "=3.0.0"
-solana-message = { version = "=3.0.1", features = ["bincode"] }
-solana-pubkey = { version = "=3.0.0", features = ["curve25519"] }
+solana-instruction = "3"
+solana-message = { version = "3", features = ["bincode"] }
+solana-pubkey = { version = "3", features = ["curve25519"] }
 thiserror = "2"
 ureq = { version = "=2.12.1", default-features = false, features = ["tls", "json"] }
+url = "2"

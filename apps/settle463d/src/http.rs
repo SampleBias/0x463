@@ -328,8 +328,9 @@ async fn get(
 ) -> Result<(Vec<u8>, &'static str)> {
     let body = match path {
         ["v1", "health"] => json_bytes(json!({"status":"ok","version":"0.1"}))?,
-        ["v1", "sim", "clock"] => {
-            let clock = db::clock(&mut *s.pool.acquire().await?).await?;
+        ["v1", "clock"] | ["v1", "sim", "clock"] => {
+            if path.len()==3 && s.chain.is_some() { return Err(ApiError::missing()); }
+            let clock = db::ledger_clock(s,&mut *s.pool.acquire().await?).await?;
             json_bytes(json!({"clock":clock.to_string(),"environment":s.config.environment}))?
         }
         ["v1", "offers"] => {
@@ -500,7 +501,7 @@ async fn upload(
     }
     let agreement = db::agreement(db, &s.config.environment, order).await?;
     let (_, q) = agreement.terms(&s.config.environment)?;
-    if db::clock(db).await? >= timestamp(&q.deadlines.deliver_by)? {
+    if db::ledger_clock(s,db).await? >= timestamp(&q.deadlines.deliver_by)? {
         return Err(ApiError::conflict("STATE_CONFLICT"));
     }
     let stored: Option<String> =
@@ -618,6 +619,7 @@ async fn post(
             finish(tx, &i, result, None).await
         }
         ["v1", "sim", "clock"] => {
+            if s.chain.is_some() {return Err(ApiError::missing());}
             if h.get("x-sim-admin").and_then(|h| h.to_str().ok())
                 != Some(s.config.admin_token.as_str())
             {

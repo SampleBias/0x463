@@ -1,5 +1,6 @@
 //! Loopback HTTP coordinator for the simulator deployment.
 mod actions;
+mod chain;
 mod db;
 mod http;
 #[cfg(test)]
@@ -33,8 +34,10 @@ type Conn = sqlx::SqliteConnection;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// Simulator genesis and local storage. Existing databases pin their genesis and receipt issuer.
+/// Local storage and genesis pins for a simulator or validator coordinator.
 pub struct Config {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<settle463_solana::Deployment>,
     pub database: PathBuf,
     pub artifact_root: PathBuf,
     pub environment: String,
@@ -45,6 +48,7 @@ pub struct Config {
     pub admin_token: String,
 }
 struct State {
+    chain: Option<chain::Chain>,
     pool: SqlitePool,
     config: Config,
     key: SigningKey,
@@ -214,11 +218,12 @@ async fn check_sqlite_runtime() -> std::result::Result<(), BoxError> {
 
 async fn open(c: Config) -> std::result::Result<Shared, BoxError> {
     environment(&c.environment)?;
-    if !c.environment.starts_with("sim:") || c.clock < 0 {
+    if c.environment.starts_with("solana:") != c.deployment.is_some() || c.clock < 0 {
         return Err("invalid simulator environment or clock".into());
     }
     hex::<32>(&c.buyer)?;
     hex::<32>(&c.admin_token)?;
+    let chain = c.deployment.as_ref().map(|deployment| chain::Chain::new(deployment, &c.environment)).transpose()?;
     check_sqlite_runtime().await?;
     tokio::fs::create_dir_all(&c.artifact_root).await?;
     let key = SigningKey::from_bytes(&hex(tokio::fs::read_to_string(&c.issuer_seed_file)
@@ -240,7 +245,8 @@ async fn open(c: Config) -> std::result::Result<Shared, BoxError> {
         MigrationType::Simple,
         include_str!("../migrations/0001_coordinator.sql").into(),
         false,
-    )];
+    ),Migration::new(2, "solana intents".into(), MigrationType::Simple,
+        include_str!("../migrations/0002_solana_intents.sql").into(), false)];
     Migrator {
         migrations: migrations.into(),
         ..Migrator::DEFAULT
@@ -274,6 +280,7 @@ async fn open(c: Config) -> std::result::Result<Shared, BoxError> {
     }
     tx.commit().await?;
     let state = Arc::new(State {
+        chain,
         pool,
         config: c,
         key,
@@ -285,7 +292,7 @@ async fn open(c: Config) -> std::result::Result<Shared, BoxError> {
 /// Recovers committed intents before announcing the bound loopback address.
 pub async fn serve(config: Config, listener: TcpListener) -> std::result::Result<(), BoxError> {
     if !listener.local_addr()?.ip().is_loopback() {
-        return Err("simulator listener requires loopback".into());
+        return Err("coordinator listener requires loopback".into());
     }
     let state = open(config).await?;
     let app = Router::new()
@@ -326,7 +333,7 @@ pub fn run_cli(args: &[String]) -> std::result::Result<(), BoxError> {
     let cfg: Config = serde_json::from_slice(&std::fs::read(config.ok_or("missing --config")?)?)?;
     let addr: std::net::SocketAddr = address.parse()?;
     if !addr.ip().is_loopback() {
-        return Err("simulator listener requires loopback".into());
+        return Err("coordinator listener requires loopback".into());
     }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

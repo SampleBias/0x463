@@ -71,6 +71,7 @@ async fn server() -> (TestDir, Shared) {
     let issuer_seed_file = dir.0.join("issuer");
     std::fs::write(&issuer_seed_file, hex_string(key("coordinator").as_bytes())).unwrap();
     let config = Config {
+        deployment: None,
         database: dir.0.join("service.db"),
         artifact_root: dir.0.join("artifacts"),
         environment: ENV.into(),

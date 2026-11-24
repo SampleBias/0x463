@@ -1,4 +1,4 @@
-//! Simulator receipt construction and offline verification against caller-pinned identities.
+//! Signed receipt bundles and offline verification against caller-pinned identities.
 
 use crate::ident::{decimal, hex_string, timestamp};
 use crate::settlement::{
@@ -41,7 +41,7 @@ struct SimLedger {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Bundle {
+struct Bundle<L> {
     bundle_version: String,
     order_id: String,
     environment: String,
@@ -54,18 +54,50 @@ struct Bundle {
     verdict: Option<Value>,
     receipt: Value,
     observations: Vec<Value>,
-    ledger: SimLedger,
+    ledger: L,
 }
 
 pub fn make_sim_receipt(
     view: &OrderView,
     failed_verdict: Option<&SignedMessage>,
 ) -> Result<Receipt, ReceiptError> {
+    terminal_receipt(
+        view,
+        failed_verdict,
+        "sim",
+        "simulated-final",
+        Some(view.terminal_clock.ok_or(InvalidEvidence)?),
+    )
+}
+
+pub fn make_solana_receipt(
+    view: &OrderView,
+    failed_verdict: Option<&SignedMessage>,
+) -> Result<Receipt, ReceiptError> {
+    terminal_receipt(
+        view,
+        failed_verdict,
+        "solana",
+        "finalized",
+        Some(view.terminal_clock.ok_or(InvalidEvidence)?),
+    )
+}
+
+fn terminal_receipt(
+    view: &OrderView,
+    failed_verdict: Option<&SignedMessage>,
+    kind: &str,
+    finality: &str,
+    clock: Option<i64>,
+) -> Result<Receipt, ReceiptError> {
     let r = &view.review;
-    let clock = view.terminal_clock.ok_or(InvalidEvidence)?;
     let locator = view.terminal_locator.as_ref().ok_or(InvalidEvidence)?;
     let amount = decimal(&r.principal).map_err(|_| InvalidEvidence)?;
-    if !r.environment.starts_with("sim:") || amount == 0 || view.held != 0 || clock < 0 {
+    if r.environment.split(':').next() != Some(kind)
+        || amount == 0
+        || view.held != 0
+        || clock.is_some_and(|now| now < 0)
+    {
         return Err(InvalidEvidence);
     }
     let delivered = view.delivery_id.is_some();
@@ -74,7 +106,7 @@ pub fn make_sim_receipt(
     let (outcome, destination, verdict_id) = match view.state {
         OrderState::Paid
             if delivered
-                && clock < resolve
+                && clock.is_none_or(|now| now < resolve)
                 && view.paid == amount
                 && view.refunded == 0
                 && failed_verdict.is_none() =>
@@ -88,9 +120,9 @@ pub fn make_sim_receipt(
         OrderState::Refunded
             if view.refunded == amount && view.paid == 0 && view.verdict_id.is_none() =>
         {
-            let outcome = if delivered && clock >= resolve {
+            let outcome = if delivered && clock.is_none_or(|now| now >= resolve) {
                 "refunded_timeout_after_delivery"
-            } else if !delivered && clock >= deliver {
+            } else if !delivered && clock.is_none_or(|now| now >= deliver) {
                 "refunded_timeout_before_delivery"
             } else {
                 return Err(InvalidEvidence);
@@ -131,9 +163,9 @@ pub fn make_sim_receipt(
         acceptance_id: r.acceptance_id.clone(),
         environment: r.environment.clone(),
         destination: destination.clone(),
-        ledger_kind: "sim".into(),
+        ledger_kind: kind.into(),
         terminal_locator: locator.clone(),
-        finality: "simulated-final".into(),
+        finality: finality.into(),
         delivery_id: view.delivery_id.clone(),
         verdict_id,
     })
@@ -179,6 +211,37 @@ pub fn build_sim_bundle(
     {
         return Err(InvalidEvidence);
     }
+    let bytes = assemble(
+        agreement,
+        delivery,
+        verdict,
+        receipt,
+        observations,
+        ledger(view, body)?,
+    )?;
+    verify_sim_bundle(&bytes, &issuer_trust(body))?;
+    Ok(bytes)
+}
+
+fn issuer_trust(receipt: &Receipt) -> ReceiptTrust {
+    ReceiptTrust {
+        trusted_issuer: receipt.receipt_issuer.clone(),
+        trusted_order: receipt.order_id.clone(),
+        environment: receipt.environment.clone(),
+    }
+}
+
+fn assemble<L: Serialize>(
+    agreement: &Agreement,
+    delivery: Option<&SignedMessage>,
+    verdict: Option<&SignedMessage>,
+    receipt: &SignedMessage,
+    observations: &[SignedMessage],
+    ledger: L,
+) -> Result<Vec<u8>, ReceiptError> {
+    let Body::Receipt(body) = &receipt.unsigned().payload else {
+        return Err(InvalidEvidence);
+    };
     let bundle = Bundle {
         bundle_version: "0.1".into(),
         order_id: body.order_id.clone(),
@@ -190,31 +253,35 @@ pub fn build_sim_bundle(
         verdict: verdict.map(value).transpose()?,
         receipt: value(receipt)?,
         observations: observations.iter().map(value).collect::<Result<_, _>>()?,
-        ledger: ledger(view, body)?,
+        ledger,
     };
-    let bytes = serde_json::to_vec(&bundle).map_err(|_| InvalidEvidence)?;
-    verify_sim_bundle(
-        &bytes,
-        &ReceiptTrust {
-            trusted_issuer: view.review.receipt_issuer.clone(),
-            trusted_order: view.review.order_id.clone(),
-            environment: view.review.environment.clone(),
-        },
-    )?;
-    Ok(bytes)
+    serde_json::to_vec(&bundle).map_err(|_| InvalidEvidence)
 }
 
-/// Checks the signed order and its internal simulator evidence. External trust pins are
-/// checked after authentication so a damaged signature is reported as invalid evidence.
-pub fn verify_sim_bundle(bytes: &[u8], trust: &ReceiptTrust) -> Result<Receipt, ReceiptError> {
+fn decode<L: serde::de::DeserializeOwned + Serialize>(
+    bytes: &[u8],
+    prefix: &str,
+) -> Result<Bundle<L>, ReceiptError> {
     let parsed = canonical::parse(bytes).map_err(|_| InvalidEvidence)?;
-    let b: Bundle = serde_json::from_value(parsed.clone()).map_err(|_| InvalidEvidence)?;
+    let b: Bundle<L> = serde_json::from_value(parsed.clone()).map_err(|_| InvalidEvidence)?;
     if b.bundle_version != "0.1"
-        || !b.environment.starts_with("sim:")
+        || !b.environment.starts_with(prefix)
         || serde_json::to_value(&b).map_err(|_| InvalidEvidence)? != parsed
     {
         return Err(InvalidEvidence);
     }
+    Ok(b)
+}
+
+struct Checked {
+    agreement: Agreement,
+    delivery: Option<SignedMessage>,
+    verdict: Option<SignedMessage>,
+    receipt: Receipt,
+    view: OrderView,
+}
+
+fn checked<L>(b: &Bundle<L>, clock: Option<i64>, locator: &str) -> Result<Checked, ReceiptError> {
     let message = |v: &Value| {
         parse_signed(
             &canonical::canonical(v).map_err(|_| InvalidEvidence)?,
@@ -227,7 +294,7 @@ pub fn verify_sim_bundle(bytes: &[u8], trust: &ReceiptTrust) -> Result<Receipt, 
         quote: message(&b.quote)?,
         acceptance: message(&b.acceptance)?,
     };
-    let review = Review::sim_fund(&agreement, &b.environment).map_err(|_| InvalidEvidence)?;
+    let review = Review::from_agreement(&agreement, &b.environment).map_err(|_| InvalidEvidence)?;
     let (_, quote) = agreement
         .terms(&b.environment)
         .map_err(|_| InvalidEvidence)?;
@@ -273,16 +340,9 @@ pub fn verify_sim_bundle(bytes: &[u8], trust: &ReceiptTrust) -> Result<Receipt, 
             .as_ref()
             .filter(|_| state == OrderState::Paid)
             .map(|m| hex_string(m.id())),
-        terminal_clock: Some(timestamp(&b.ledger.clock).map_err(|_| InvalidEvidence)?),
-        terminal_locator: Some(b.ledger.terminal_locator.clone()),
+        terminal_clock: clock,
+        terminal_locator: Some(locator.to_owned()),
     };
-    let expected = make_sim_receipt(
-        &view,
-        verdict.as_ref().filter(|_| state == OrderState::Refunded),
-    )?;
-    if **receipt != expected || b.ledger != ledger(&view, &expected)? {
-        return Err(InvalidEvidence);
-    }
     let mut prev = 0;
     for item in &b.observations {
         let m = message(item)?;
@@ -298,11 +358,37 @@ pub fn verify_sim_bundle(bytes: &[u8], trust: &ReceiptTrust) -> Result<Receipt, 
         }
         prev = seq;
     }
-    if trust.environment != b.environment
-        || trust.trusted_order != b.order_id
-        || trust.trusted_issuer != view.review.receipt_issuer
-    {
+    Ok(Checked {
+        agreement,
+        delivery,
+        verdict,
+        receipt: *receipt.clone(),
+        view,
+    })
+}
+
+/// Authenticates the signed agreement and its simulator evidence before comparing caller trust.
+pub fn verify_sim_bundle(bytes: &[u8], trust: &ReceiptTrust) -> Result<Receipt, ReceiptError> {
+    let b: Bundle<SimLedger> = decode(bytes, "sim:")?;
+    let c = checked(
+        &b,
+        Some(timestamp(&b.ledger.clock).map_err(|_| InvalidEvidence)?),
+        &b.ledger.terminal_locator,
+    )?;
+    let expected = make_sim_receipt(
+        &c.view,
+        c.verdict
+            .as_ref()
+            .filter(|_| c.view.state == OrderState::Refunded),
+    )?;
+    if c.receipt != expected || b.ledger != ledger(&c.view, &expected)? {
+        return Err(InvalidEvidence);
+    }
+    if &issuer_trust(&expected) != trust {
         return Err(ReceiptError::Untrusted);
     }
     Ok(expected)
 }
+
+mod solana;
+pub use solana::{build_solana_bundle, verify_solana_bundle, SolanaLedger, VerifiedSolanaBundle};

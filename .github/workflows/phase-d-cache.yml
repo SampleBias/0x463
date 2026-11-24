@@ -2,7 +2,7 @@ name: Phase D registry preparation
 on:
   push:
     branches: [build/phase-d-validator]
-    paths: ['.github/workflows/phase-d-cache.yml']
+    paths: ['.github/workflows/phase-d-cache.yml', '**/Cargo.toml']
 permissions:
   contents: read
 jobs:

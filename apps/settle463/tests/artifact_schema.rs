@@ -50,6 +50,7 @@ fn committed_extra_field_fails_schema_and_keeps_principal_until_timeout(
     let dir = std::env::temp_dir().join(format!("settle463-schema-{buyer_key}"));
     fs::create_dir(&dir)?;
     let config = settle463d::Config {
+        deployment: None,
         database: dir.join("db.sqlite"),
         artifact_root: dir.join("artifacts"),
         environment: env.clone(),

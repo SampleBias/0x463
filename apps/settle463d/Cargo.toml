@@ -15,3 +15,7 @@ ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] 
 getrandom = "0.2"
 settle463-core = { path = "../../crates/settle463-core" }
 settle463-sim = { path = "../../crates/settle463-sim" }
+
+settle463-solana = { path = "../../crates/settle463-solana" }
+base64 = "0.22"
+bs58 = "0.5"

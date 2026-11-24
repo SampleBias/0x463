@@ -8,7 +8,7 @@ use settle463_core::{
 use settle463_sim::Simulator;
 use sqlx::Row;
 
-fn action(v: &Value) -> Result<Action> {
+pub(super) fn action(v: &Value) -> Result<Action> {
     match field(v, "action")? {
         "commit_delivery" => Ok(Action::CommitDelivery),
         "release" => Ok(Action::Release),
@@ -16,7 +16,7 @@ fn action(v: &Value) -> Result<Action> {
         _ => Err(ApiError::bad("BAD_ENCODING")),
     }
 }
-async fn evidence(
+pub(super) async fn evidence(
     s: &State,
     db: &mut Conn,
     order: &str,
@@ -122,7 +122,7 @@ fn check_fields(command: &Value, signed: bool) -> Result<()> {
     Ok(())
 }
 
-async fn require_local_settlement(s: &State, db: &mut Conn, order: &str) -> Result<()> {
+pub(super) async fn require_local_settlement(s: &State, db: &mut Conn, order: &str) -> Result<()> {
     let local = hex_string(s.key.verifying_key().as_bytes());
     if !db::member(db, order, &local, "receipt_issuer").await? {
         return Err(ApiError::denied("ROLE_FORBIDDEN"));
@@ -132,6 +132,7 @@ async fn require_local_settlement(s: &State, db: &mut Conn, order: &str) -> Resu
 
 pub(crate) async fn prepare(s: &State, db: &mut Conn, order: &str, v: &Value) -> Result<Vec<u8>> {
     require_local_settlement(s, db, order).await?;
+    if let Some(chain)=&s.chain { return chain.prepare(s,db,order,v).await; }
     check_fields(v, false)?;
     let sim = restore(s, db).await?;
     if field(v, "action")? == "fund" {
@@ -145,6 +146,7 @@ pub(crate) async fn prepare(s: &State, db: &mut Conn, order: &str, v: &Value) ->
 
 pub(crate) async fn enqueue(s: &State, db: &mut Conn, order: &str, v: &Value) -> Result<String> {
     require_local_settlement(s, db, order).await?;
+    if let Some(chain)=&s.chain { return chain.enqueue(s,db,order,v).await; }
     check_fields(v, true)?;
     let action = field(v, "action")?;
     let input = canonical::canonical(v)?;
@@ -197,7 +199,7 @@ pub(crate) async fn enqueue(s: &State, db: &mut Conn, order: &str, v: &Value) ->
     .await?;
     Ok(intent)
 }
-async fn receipt(s: &State, db: &mut Conn, view: &OrderView) -> Result<()> {
+pub(super) async fn receipt(s: &State, db: &mut Conn, view: &OrderView, ledger:Option<&settle463_core::receipt::SolanaLedger>) -> Result<()> {
     let order = &view.review.order_id;
     require_local_settlement(s, db, order).await?;
     let a = db::agreement(db, &s.config.environment, order).await?;
@@ -225,7 +227,10 @@ async fn receipt(s: &State, db: &mut Conn, view: &OrderView) -> Result<()> {
     let fail = verdict
         .as_ref()
         .filter(|m| matches!(&m.unsigned().payload,Body::Verdict(v) if v.decision=="FAIL"));
-    let body = settle463_core::receipt::make_sim_receipt(view, fail)?;
+    let body = match ledger {
+        Some(_) => settle463_core::receipt::make_solana_receipt(view,fail)?,
+        None => settle463_core::receipt::make_sim_receipt(view,fail)?,
+    };
     let receipt = db::issuer_sign(s, Body::Receipt(Box::new(body)))?;
     let id = hex_string(receipt.id());
     db::insert_message(db, &receipt, &receipt.to_wire()?).await?;
@@ -249,14 +254,10 @@ async fn receipt(s: &State, db: &mut Conn, view: &OrderView) -> Result<()> {
         .iter()
         .map(|b| settle463_core::parse_signed(b, &s.config.environment))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let bundle = settle463_core::receipt::build_sim_bundle(
-        &a,
-        delivery.as_ref(),
-        verdict.as_ref(),
-        &receipt,
-        &observations,
-        view,
-    )?;
+    let bundle = match ledger {
+        Some(ledger)=>settle463_core::receipt::build_solana_bundle(&a,delivery.as_ref(),verdict.as_ref(),&receipt,&observations,ledger)?,
+        None=>settle463_core::receipt::build_sim_bundle(&a,delivery.as_ref(),verdict.as_ref(),&receipt,&observations,view)?,
+    };
     sqlx::query("INSERT INTO receipts VALUES(?,?,?)")
         .bind(order)
         .bind(id)
@@ -267,6 +268,7 @@ async fn receipt(s: &State, db: &mut Conn, view: &OrderView) -> Result<()> {
 }
 
 pub(crate) async fn process(s: &State, id: &str) -> Result<()> {
+    if let Some(chain)=&s.chain {return chain.process(s,id).await;}
     let mut tx = s.pool.begin_with("BEGIN IMMEDIATE").await?;
     let row =
         sqlx::query("SELECT order_id,action,signed_bytes,state FROM intents WHERE intent_id=?")
@@ -341,7 +343,7 @@ pub(crate) async fn process(s: &State, id: &str) -> Result<()> {
             )
             .await?;
             if matches!(view.state, OrderState::Paid | OrderState::Refunded) {
-                receipt(s, &mut tx, &view).await?;
+                receipt(s, &mut tx, &view, None).await?;
             }
         }
         Err(e) if e.0.is_server_error() => return Err(e),
@@ -386,6 +388,7 @@ pub(crate) async fn recover(s: &State) -> Result<()> {
             .await?;
         }
     }
+    if let Some(chain)=&s.chain {chain.discover_refunds(s).await?;}
     Ok(())
 }
 pub(crate) async fn status(db: &mut Conn, order: &str, id: &str) -> Result<Vec<u8>> {
