@@ -12,13 +12,13 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - name: Install Anchor 0.32.1 and Agave 2.3.0
+      - name: Install Anchor 1.2.2 and Agave 4.1.2
         working-directory: ${{ runner.temp }}
         run: |
-          curl --fail --location --retry 3 --output anchor https://github.com/solana-foundation/anchor/releases/download/v0.32.1/anchor-0.32.1-x86_64-unknown-linux-gnu
-          curl --fail --location --retry 3 --output agave.tar.bz2 https://github.com/anza-xyz/agave/releases/download/v2.3.0/solana-release-x86_64-unknown-linux-gnu.tar.bz2
-          echo '5f25b850ce80278507a98947833fcd48423391f6d145046ffb0c5fd130dec436  anchor' | sha256sum --check
-          echo '56241fbe862495ff01b2b875195e44f94c22e9f2a504591a3ade1b9d82862730  agave.tar.bz2' | sha256sum --check
+          curl --fail --location --retry 3 --output anchor https://github.com/otter-sec/anchor/releases/download/v1.2.2/anchor-1.2.2-x86_64-unknown-linux-gnu
+          curl --fail --location --retry 3 --output agave.tar.bz2 https://github.com/anza-xyz/agave/releases/download/v4.1.2/solana-release-x86_64-unknown-linux-gnu.tar.bz2
+          echo 'e2c35a973bcfe476f3a89b120e99820f917229faf33d3e71f6625bd94199e741  anchor' | sha256sum --check
+          echo '5991d027a686eb419a709a479178b33eb83501e8a2bfbf599a81a286bfcbf770  agave.tar.bz2' | sha256sum --check
           install -Dm755 anchor "$RUNNER_TEMP/anchor-bin/anchor"
           tar -xjf agave.tar.bz2
           echo "$RUNNER_TEMP/anchor-bin" >> "$GITHUB_PATH"
