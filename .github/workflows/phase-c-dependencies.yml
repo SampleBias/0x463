@@ -1,44 +1,30 @@
-name: Resolve Phase C dependencies
+name: Fetch locked Phase C archives
 on:
   push:
     paths: ['.github/workflows/phase-c-dependencies.yml']
-permissions:
-  contents: read
+permissions: {}
 jobs:
-  resolve:
+  archives:
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        slice: [0,1,2,3]
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          persist-credentials: false
-      - name: Resolve on the workspace toolchain
+      - name: Verify and stream missing public registry archives
+        shell: python
+        env:
+          SLICE: ${{ matrix.slice }}
         run: |
-          cat >> apps/settle463d/Cargo.toml <<'DEPS'
-
-          [dependencies]
-          axum = "=0.8.8"
-          sqlx = {version="=0.8.6",default-features=false,features=["runtime-tokio","sqlite","migrate"]}
-          tokio = {version="1",features=["rt-multi-thread","macros","net","sync","fs","time"]}
-          serde = {version="1",features=["derive"]}
-          serde_json = "1"
-          ureq = {version="=2.12.1",default-features=false}
-          DEPS
-          cargo metadata --format-version 1 >/dev/null
-          python3 - <<'PY'
-          import base64,gzip,tarfile,io,json,tomllib,pathlib
-          lock=pathlib.Path("Cargo.lock")
-          names={p["name"]:[] for p in tomllib.loads(lock.read_text())["package"] if "source" in p}
-          for p in tomllib.loads(lock.read_text())["package"]:
-              if "source" in p: names[p["name"]].append(p["version"])
-          home=next((pathlib.Path.home()/".cargo/registry/index").glob("index.crates.io-*"))
-          index={}
-          for n,vs in names.items():
-              key = ("1/"+n if len(n)==1 else "2/"+n if len(n)==2 else "3/"+n[:1]+"/"+n if len(n)==3 else n[:2]+"/"+n[2:4]+"/"+n)
-              raw=(home/".cache"/key).read_bytes().split(b"\0")
-              vals=[json.loads(v) for v in raw if v.startswith(b"{") and json.loads(v)["vers"] in vs]
-              if len(vals)!=len(vs): raise ValueError(n)
-              index[key]=vals
-          payload=gzip.compress(json.dumps({"lock":lock.read_text(),"index":index},separators=(",",":")).encode())
-          encoded=base64.b64encode(payload).decode()
-          for i in range(0,len(encoded),2048):print("C_META",i,encoded[i:i+2048])
-          PY
+          import base64,hashlib,json,os,urllib.request
+          files=json.loads('{"atoi-2.0.0.crate":["atoi","f28d99ec8bfea296261ca1af174f24225171fea9664ba9003cbebee704810528"],"bytes-1.12.2.crate":["bytes","776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"],"cc-1.11.3.crate":["cc","02f0e023adb368345ce0ca6cdfc0f24a06554468d0e8503e14a0841de79bfa69"],"crc-catalog-2.5.0.crate":["crc-catalog","217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"],"crossbeam-queue-0.3.14.crate":["crossbeam-queue","03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae"],"either-1.19.0.crate":["either","0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"],"etcetera-0.8.0.crate":["etcetera","136d1b5283a1ab77bd9257427ffd09d8667ced0570b6f938942bc7568ed5b943"],"event-listener-5.4.2.crate":["event-listener","5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"],"flume-0.11.1.crate":["flume","da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"],"form_urlencoded-1.2.3.crate":["form_urlencoded","afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"],"futures-intrusive-0.5.0.crate":["futures-intrusive","1d930c203dd0b6ff06e0201a4a2fe9149b43c684fd4420555b26d21b1a02956f"],"hashbrown-0.17.2.crate":["hashbrown","735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"],"hashlink-0.10.0.crate":["hashlink","7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1"],"hyper-1.13.0.crate":["hyper","229c6ff5584df4c6becbfe00567128bac768c8cd32ebc8a8366bd81ed072e8f3"],"lazy_static-1.5.1.crate":["lazy_static","20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"],"libredox-0.1.25.crate":["libredox","61ff90caf6077a803a240f62fdbe88645a890bbca49ef8174c3cb0404362171d"],"libsqlite3-sys-0.30.1.crate":["libsqlite3-sys","2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"],"md-5-0.10.6.crate":["md-5","d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"],"mime-0.3.18.crate":["mime","d5848f5a9e8117cf94f2f90faac24a87ff81600ff8628c1e3deaab572e76bfa1"],"num-bigint-dig-0.8.6.crate":["num-bigint-dig","e661dda6640fad38e827a6d4a310ff4763082116fe217f279885c97f511bb0b7"],"num-iter-0.1.46.crate":["num-iter","c92800bd69a1eac91786bcfe9da64a897eb72911b8dc3095decbd07429e8048b"],"pem-rfc7468-0.7.0.crate":["pem-rfc7468","88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"],"pin-project-lite-0.2.18.crate":["pin-project-lite","c938015719552d665fd0553b90d96cd7ff58e83e4c061ca99e6bb78865a72752"],"pkcs1-0.7.5.crate":["pkcs1","c8ffb9f10fa047879315e6625af03c164b16962a5368d724ed16323b68ace47f"],"redox_syscall-0.9.5.crate":["redox_syscall","580c875845b41ecb1564ad1ae4703044cef774145e3d7a94dc2b3fa7c97868fd"],"rsa-0.9.10.crate":["rsa","b8573f03f5883dcaebdfcf4725caa1ecb9c15b2ef50c43a07b816e06799bb12d"],"smallvec-1.16.6.crate":["smallvec","3244542535d5de959d90ec55d1b5ff0fd2bb7b1310223907d5f11932847f7b59"],"sqlx-0.8.6.crate":["sqlx","1fefb893899429669dcdd979aff487bd78f4064e5e7907e4269081e0ef7d97dc"],"sqlx-core-0.8.6.crate":["sqlx-core","ee6798b1838b6a0f69c007c133b8df5866302197e404e8b6ee8ed3e3a5e68dc6"],"sqlx-macros-0.8.6.crate":["sqlx-macros","a2d452988ccaacfbf5e0bdbc348fb91d7c8af5bee192173ac3636b5fb6e6715d"],"sqlx-macros-core-0.8.6.crate":["sqlx-macros-core","19a9c1841124ac5a61741f96e1d9e2ec77424bf323962dd894bdb93f37d5219b"],"sqlx-mysql-0.8.6.crate":["sqlx-mysql","aa003f0038df784eb8fecbbac13affe3da23b45194bd57dba231c8f48199c526"],"sqlx-postgres-0.8.6.crate":["sqlx-postgres","db58fcd5a53cf07c184b154801ff91347e4c30d17a3562a635ff028ad5deda46"],"sqlx-sqlite-0.8.6.crate":["sqlx-sqlite","c2d12fe70b2c1b4401038055f90f151b78208de1f9f89a7dbfd41587a10c3eea"],"stringprep-0.1.5.crate":["stringprep","7b4df3d392d81bd458a8a621b8bffbd2302a12ffe288a9d931670948749463b1"],"tokio-stream-0.1.19.crate":["tokio-stream","a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"],"unicode-bidi-0.3.18.crate":["unicode-bidi","5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"],"unicode-normalization-0.1.26.crate":["unicode-normalization","75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"],"unicode-properties-0.1.5.crate":["unicode-properties","993ad287eb20e8ba755312801cfe1413e0f25d604075863acaddca10b04c1833"],"url-2.5.9.crate":["url","f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"],"wasite-0.1.0.crate":["wasite","b8dad83b4f25e74f184f64c43b150b91efe7647395b42289f38e50566d82855b"],"whoami-1.6.1.crate":["whoami","5d4a4db5077702ca3015d3d02d74974948aba2ad9e12ab7df718ee64ccd7e97d"],"zerocopy-0.8.64.crate":["zerocopy","ed43f3060383c64b000f3c630550aebdfa9d3b76d48de32390483dd2cc7e0865"],"zerocopy-derive-0.8.64.crate":["zerocopy-derive","a5cbd820fe3e35fb38c83b6dc7e6b1618bc46e0cd10073ae94e8d52dc468d8b9"]}')
+          shard=int(os.environ["SLICE"])
+          for index,(filename,(package,checksum)) in enumerate(files.items()):
+              large=package=="libsqlite3-sys"
+              if not large and index%4!=shard: continue
+              with urllib.request.urlopen(f"https://static.crates.io/crates/{package}/{filename}") as f:
+                  data=f.read()
+              if hashlib.sha256(data).hexdigest()!=checksum: raise ValueError(filename)
+              encoded=base64.b64encode(data).decode()
+              for i in range(0,len(encoded),4096):
+                  if not large or (i//4096)%4==shard:
+                      print("C_CRATE",filename,i,encoded[i:i+4096])
