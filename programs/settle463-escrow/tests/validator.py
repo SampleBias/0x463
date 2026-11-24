@@ -12,7 +12,7 @@ import secrets
 import struct
 import time
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from solders.compute_budget import set_compute_unit_price
 from solders.hash import Hash
@@ -123,7 +123,7 @@ class Validator:
     def rpc(self, method, *params):
         request = Request(self.rpc_url, data=json.dumps(dict(jsonrpc="2.0", id=1, method=method, params=params)).encode(),
                           headers={"content-type": "application/json"})
-        with urlopen(request, timeout=15) as stream:
+        with build_opener(ProxyHandler({})).open(request, timeout=15) as stream:
             value = json.load(stream)
         require("error" not in value, f"{method}: {value.get('error')}")
         return value["result"]
@@ -139,8 +139,14 @@ class Validator:
     def amount(self, key):
         return struct.unpack_from("<Q", self.data(key), 64)[0]
 
+    def clock_sample(self, min_slot=0):
+        result = self.rpc("getAccountInfo", str(CLOCK), {"encoding": "base64", "commitment": "processed",
+                                                         "minContextSlot": min_slot})
+        data = base64.b64decode(result["value"]["data"][0], validate=True)
+        return result["context"]["slot"], struct.unpack_from("<q", data, 32)[0]
+
     def now(self):
-        return struct.unpack_from("<q", self.data(CLOCK, "processed"), 32)[0]
+        return self.clock_sample()[1]
 
     def wait_clock(self, target):
         end = time.monotonic() + 90
@@ -326,22 +332,24 @@ def program_cases(v):
     print("T-SOL-01..07,09 and terminal replays passed", flush=True)
 
 
-def simulated_timestamp(v, signed, timestamp, expected_error):
+def simulated_timestamp(v, signed, before_slot, timestamp, expected_error):
     signed_wire = base64.b64encode(bytes(signed)).decode()
     resp = v.rpc("simulateTransaction", signed_wire, {
-        "sigVerify": True, "encoding": "base64", "commitment": "processed",
+        "sigVerify": True, "encoding": "base64", "commitment": "processed", "minContextSlot": before_slot,
         "accounts": {"encoding": "base64", "addresses": [str(CLOCK)]},
     })
     result = resp["value"]
-    # Some RPC versions omit post-simulation accounts for a failed transaction. The
-    # local bank's processed slot and clock are sampled on both sides in that case.
+    slot = resp["context"]["slot"]
+    # Agave omits post-simulation accounts for failures. Bracket that bank with
+    # two Clock reads from the same second before accepting its deadline result.
     clocks = result.get("accounts")
     if clocks and clocks[0]:
         bank_ts = struct.unpack_from("<q", base64.b64decode(clocks[0]["data"][0]), 32)[0]
     else:
-        bank_ts = v.now()
+        after_slot, bank_ts = v.clock_sample(min_slot=slot)
+        require(before_slot <= slot <= after_slot, "simulation escaped sampled bank range")
     if bank_ts != timestamp:
-        return False
+        return None
     if expected_error is None:
         require(result["err"] is None, f"unexpected boundary failure at {timestamp}: {result['err']}")
     else:
@@ -349,7 +357,7 @@ def simulated_timestamp(v, signed, timestamp, expected_error):
         ix_err = error.get("InstructionError")
         require(isinstance(ix_err, list) and ix_err[1] == {"Custom": expected_error},
                 f"wrong deadline error at {timestamp}: {error}")
-    return True
+    return slot
 
 
 def boundary_attempt(v, attempt):
@@ -385,18 +393,22 @@ def boundary_attempt(v, attempt):
             (v.signed([ref], v.admin), 6002 if early else None),
             (v.signed([silent.terminal(v.program, caller=v.admin.pubkey())], v.admin), 6002 if early else None),
         ]
+    sampled_slots = {}
     with ThreadPoolExecutor(max_workers=8) as pool:
         for offset in (-1, 0, 1):
             expected_time = target + offset
             v.wait_clock(expected_time)
-            if v.now() != expected_time:
+            before_slot, timestamp = v.clock_sample()
+            if timestamp != expected_time:
                 print(f"Boundary sampling {attempt}: missed validator second {expected_time}", flush=True)
                 return False
-            jobs = [pool.submit(simulated_timestamp, v, tx, expected_time, error) for tx, error in signed_cases[offset]]
-            matched = [job.result() for job in jobs]
-            if not all(matched):
+            jobs = [pool.submit(simulated_timestamp, v, tx, before_slot, expected_time, error)
+                    for tx, error in signed_cases[offset]]
+            slots = [job.result() for job in jobs]
+            if any(slot is None for slot in slots):
                 print(f"Boundary sampling {attempt}: validator second changed during simulation", flush=True)
                 return False
+            sampled_slots[str(offset)] = slots
             if offset == 0:
                 if v.now() != target:
                     return False
@@ -408,6 +420,7 @@ def boundary_attempt(v, attempt):
     require(v.data(order.escrow)[488] == 3 and v.amount(order.vault) == 0, "deadline race did not refund once")
     v.evidence["deadline_boundaries"] = dict(clock_mechanism="natural Clock sysvar seconds, processed-bank simulation",
                                              target=target, offsets=[-1, 0, 1], cases_per_offset=6,
+                                             simulation_slots=sampled_slots,
                                              late_signed_release=late_release_sig, refund=refund_sig)
     return True
 

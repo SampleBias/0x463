@@ -93,7 +93,9 @@ def prepare(directory, url, program):
     cfg = directory / "cli.yml"
     subprocess.run(["solana", "--config", str(cfg), "config", "set", "--url", url, "--keypair",
                     str(directory/"fee-payer.json"), "--commitment", "finalized"], check=True)
-    spl = ["spl-token", "--config", str(cfg), "--url", url, "--program-id", str(TOKEN)]
+    spl = ["spl-token", "--config", str(cfg), "--url", url, "--program-id", str(TOKEN),
+           "--fee-payer", str(directory/"fee-payer.json")]
+    subprocess.run(["spl-token", "--version"], check=True)
     subprocess.run(spl + ["create-token", "--decimals", "6", "--enable-freeze", "--mint-authority",
                           str(authority), str(directory/"mint.json")], check=True)
     for owner in [buyer, seller]:
