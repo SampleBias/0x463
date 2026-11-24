@@ -1,0 +1,30 @@
+name: Prepare locked domain dependencies
+on:
+  push:
+    branches: [build/phase-a-domain]
+permissions:
+  contents: read
+jobs:
+  dependencies:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Retrieve the two public archives missing from the offline cache
+        shell: python
+        run: |
+          import base64, hashlib, pathlib, tomllib, urllib.request
+          packages = tomllib.loads(pathlib.Path("Cargo.lock").read_text())["package"]
+          for pkg in packages:
+              name, version = pkg["name"], pkg["version"]
+              if name not in {"curve25519-dalek", "fiat-crypto"}:
+                  continue
+              archive = f"{name}-{version}.crate"
+              with urllib.request.urlopen(f"https://static.crates.io/crates/{name}/{archive}") as response:
+                  data = response.read()
+              if hashlib.sha256(data).hexdigest() != pkg["checksum"]:
+                  raise ValueError(archive)
+              encoded = base64.b64encode(data).decode("ascii")
+              for pos in range(0, len(encoded), 2048):
+                  print(f"cargo-public-archive {archive} {pos} {encoded[pos:pos+2048]}")
