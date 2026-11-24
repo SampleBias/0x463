@@ -4,3 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+
+[dependencies]
+settle463-core = { path = "../settle463-core" }
+getrandom = "0.2"

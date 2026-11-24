@@ -2,9 +2,10 @@
 
 pub mod canonical;
 pub mod ident;
+pub mod settlement;
 mod validate;
 pub mod wire;
-pub use validate::check_quote_request;
+pub use validate::{check_quote_request, check_quote_terms};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};

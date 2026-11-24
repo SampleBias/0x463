@@ -11,3 +11,10 @@ message_id=ac78a7245326764d548f13907645c1ffcaf926da6a24292f4ca480e45d668004
 worked_messages=7 negative_examples=10 receipt_id=22eb00b33ea53cb39763aa1907dc35bc47327d115f5e2c8d148fef447a5a627b
 """
 stderr = ""
+
+[[runtime]]
+name = "two parties fund an isolated simulator order"
+argv = ["cargo", "run", "--quiet", "--offline", "--locked", "-p", "settle463-sdk", "--example", "negotiate"]
+expected_exit = 0
+stdout = "Funded held=2000000 paid=0 refunded=0 buyer_balance=3000000 seller_balance=0\n"
+stderr = ""

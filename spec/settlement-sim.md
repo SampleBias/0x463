@@ -30,3 +30,11 @@ The simulator implements the trait with an atomic in-memory or SQLite ledger, pe
 The Solana adapter implements the same trait. Business rules for amounts, deadlines, and terminality are the core rules. The adapter adds transaction encoding, RPC, and finality.
 
 On terminal success the simulator locator is `sim:<order_id>:<decimal event seq>`. Its finality label is `simulated-final`. The receipt names the exact destination and funded principal. [Receipt bundle](receipts.md#receipt-bundle)
+
+## Simulator funding authorization
+
+The buyer stores one signed acceptance for each tuple of environment, buyer key and nonce. Both parties retrieve that acceptance before signing the funding command. Each independently checks the request, signed quote, acceptance and the supplied review. The buyer rechecks its spending policy. The seller rechecks its minimum amount, verifier and deployment policy.
+
+The simulator funding review is a closed JSON object. Its fields are `environment`, `order_id`, `request_id`, `quote_id`, `acceptance_id`, `policy_hash`, `buyer`, `seller`, `verifier`, `receipt_issuer`, `principal`, `asset`, `buyer_destination`, `seller_destination`, `escrow_account` and `deadlines`. The value of `principal` is the accepted quote's decimal amount. The buyer and seller destinations are copied from the quote. The escrow account is `sim-escrow:<order_id>`. The instruction debits the buyer destination and credits the escrow account by exactly the principal.
+
+Each party signs the ASCII domain `0x463/sim-fund/0.1`, one zero byte and the canonical JSON bytes of that review. The intent ID is lowercase hex SHA-256 of those same bytes. The simulator reconstructs the review from the three verified envelopes, verifies both Ed25519 signatures, and applies the check `ledger_time < fund_by` at execution. Manual finalization records a pending intent and defers the transfer until that execution succeeds. The buyer's delivery window is `deliver_by - fund_by` and its resolution window is `resolve_by - deliver_by`.

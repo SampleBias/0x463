@@ -18,3 +18,5 @@ jobs:
       - run: cargo clippy -p settle463-core --all-targets -- -D warnings
       - run: cargo test --locked -p settle463-core
       - run: python3 fixtures/tools/independent_vector.py
+      - run: cargo clippy --locked -p settle463-sim -p settle463-sdk --all-targets -- -D warnings
+      - run: cargo test --locked -p settle463-sim -p settle463-sdk

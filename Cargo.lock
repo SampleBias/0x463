@@ -281,10 +281,22 @@ version = "0.1.0"
 [[package]]
 name = "settle463-sdk"
 version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "getrandom",
+ "serde_json",
+ "settle463-core",
+ "settle463-sim",
+ "thiserror",
+]
 
 [[package]]
 name = "settle463-sim"
 version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "settle463-core",
+]
 
 [[package]]
 name = "settle463-solana"

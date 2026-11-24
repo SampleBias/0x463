@@ -82,7 +82,7 @@ pub(crate) fn policy(p: &Policy) -> Result<()> {
 }
 
 impl UnsignedMessage {
-    pub(crate) fn validate(&self, expected: &str) -> Result<()> {
+    pub fn validate(&self, expected: &str) -> Result<()> {
         require(
             self.protocol == "0x463" && self.version == "0.1",
             "protocol or version",
@@ -383,13 +383,19 @@ fn receipt(r: &Receipt, env: &str, issuer: &str) -> Result<()> {
 
 /// Checks a signed quote against the signed request, including limits outside the quote.
 pub fn check_quote_request(quote: &SignedMessage, request: &SignedMessage) -> Result<()> {
-    let (Body::Quote(q), Body::Request(r)) =
-        (&quote.unsigned().payload, &request.unsigned().payload)
-    else {
+    let Body::Quote(q) = &quote.unsigned().payload else {
+        return Err(Error::Invalid("quote kind"));
+    };
+    check_quote_terms(q, &quote.unsigned().environment, request)
+}
+
+/// Checks contextual terms before the seller signs a quote.
+pub fn check_quote_terms(q: &Quote, environment: &str, request: &SignedMessage) -> Result<()> {
+    let Body::Request(r) = &request.unsigned().payload else {
         return Err(Error::Invalid("quote/request kinds"));
     };
     require(
-        quote.unsigned().environment == request.unsigned().environment
+        environment == request.unsigned().environment
             && q.request_id == hex_string(request.id())
             && q.order_id == r.order_id
             && q.offer_id == r.offer_id

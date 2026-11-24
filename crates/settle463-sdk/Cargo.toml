@@ -4,3 +4,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+
+[dependencies]
+settle463-core = { path = "../settle463-core" }
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+getrandom = "0.2"
+thiserror = "2"
+
+[dev-dependencies]
+settle463-sim = { path = "../settle463-sim" }
+serde_json = "1"
