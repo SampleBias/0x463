@@ -37,7 +37,7 @@ cat >>"$manifest" <<'TOML'
 [dependencies.anchor-spl]
 version = "=1.2.2"
 default-features = false
-features = ["token", "associated_token"]
+features = ["solana-v3", "token", "associated_token"]
 TOML
 program_key=target/deploy/settle463_spike-keypair.json
 program_id=$(solana-keygen pubkey "$program_key")
@@ -69,6 +69,9 @@ solana-test-validator --ledger "$scratch/ledger" --bind-address 127.0.0.1 \
     >"$scratch/validator.log" 2>&1 &
 validator_pid=$!
 stop_validator() {
+    if (( $? != 0 )); then
+        tail -80 "$scratch/validator.log" "$scratch/ledger/validator.log" >&2 || true
+    fi
     kill "$validator_pid" 2>/dev/null || true
     wait "$validator_pid" 2>/dev/null || true
 }
