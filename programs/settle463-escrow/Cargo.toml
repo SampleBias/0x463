@@ -4,3 +4,25 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+
+[lib]
+name = "settle463_escrow"
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = []
+no-entrypoint = []
+cpi = ["no-entrypoint"]
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+no-idl = []
+no-log-ix-name = []
+
+[dependencies]
+anchor-lang = "=1.2.2"
+anchor-spl = { version = "=1.2.2", default-features = false, features = ["solana-v3", "token", "associated_token"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

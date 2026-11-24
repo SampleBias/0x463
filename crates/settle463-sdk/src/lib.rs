@@ -2,6 +2,8 @@
 
 mod fulfillment;
 mod http;
+mod ledger;
+pub use ledger::{LedgerAction, LedgerSigning};
 mod transport;
 pub use fulfillment::{StoredArtifact, VerifierClient};
 pub use http::{DirectPeer, HttpCoordinator, Role};
@@ -66,6 +68,9 @@ impl Identity {
     }
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         Self(SigningKey::from_bytes(seed))
+    }
+    pub fn signing_key(&self) -> &SigningKey {
+        &self.0
     }
     pub fn public_hex(&self) -> String {
         hex_string(self.0.verifying_key().as_bytes())
@@ -365,7 +370,6 @@ impl SellerClient {
         };
         policy(
             request.unsigned().environment == self.actor.env()
-                && self.actor.env().starts_with("sim:")
                 && r.seller == self.actor.identity.public_hex(),
         )?;
         let offer = self.actor.transport.fetch(&r.offer_id)?;
@@ -391,10 +395,14 @@ impl SellerClient {
             acceptance_policy: terms.policy,
             amount: terms.amount.to_string(),
             asset: r.asset.clone(),
-            settlement: Settlement::Sim {
-                asset_id: r.asset.id.clone(),
-                buyer_destination: format!("sim:{}", r.buyer),
-                seller_destination: format!("sim:{}", r.seller),
+            settlement: if self.actor.env().starts_with("sim:") {
+                Settlement::Sim {
+                    asset_id: r.asset.id.clone(),
+                    buyer_destination: format!("sim:{}", r.buyer),
+                    seller_destination: format!("sim:{}", r.seller),
+                }
+            } else {
+                self.actor.coordinator()?.ledger.as_deref().ok_or(Error::Unavailable)?.settlement(r)?
             },
             deadlines: terms.deadlines,
             expires_at: terms.expires_at.to_string(),

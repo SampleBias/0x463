@@ -42,6 +42,7 @@ impl Role {
 
 pub struct HttpCoordinator {
     base: String,
+    pub(crate) ledger: Option<Arc<dyn crate::LedgerSigning>>,
     env: String,
     pub(crate) identity: Identity,
     pub(crate) role: Role,
@@ -125,6 +126,13 @@ fn join_order(order: &str, suffix: &str) -> Result<String> {
 }
 
 impl HttpCoordinator {
+    pub fn with_ledger(mut self, signer: Arc<dyn crate::LedgerSigning>) -> Self {
+        self.ledger = Some(signer);
+        self
+    }
+    pub(crate) fn environment_name(&self) -> &str {
+        &self.env
+    }
     /// HTTP is restricted to a numeric loopback address. Private requests consume one challenge.
     pub fn new(base: &str, env: &str, identity: Identity, role: Role) -> Result<Self> {
         environment(env)?;
@@ -142,6 +150,7 @@ impl HttpCoordinator {
             .timeout(Duration::from_secs(30))
             .build();
         Ok(Self {
+            ledger: None,
             base: format!("http://{addr}"),
             env: env.to_owned(),
             identity,
@@ -199,7 +208,7 @@ impl HttpCoordinator {
             limit,
         )
     }
-    fn json_action(&self, order: &str, kind: &str, body: Value) -> Result<Value> {
+    pub(crate) fn json_action(&self, order: &str, kind: &str, body: Value) -> Result<Value> {
         let path = join_order(order, &format!("/actions/{kind}"))?;
         let auth = self.authorization("POST", &path)?;
         let bytes = serde_json::to_vec(&body)?;
@@ -328,7 +337,7 @@ impl HttpCoordinator {
         }
         Ok(returned)
     }
-    fn submit_command(&self, order: &str, intent_id: String, command: Value) -> Result<Submission> {
+    pub(crate) fn submit_command(&self, order: &str, intent_id: String, command: Value) -> Result<Submission> {
         // Retain the locally computed ID even if the server commits and the response is lost.
         self.intents
             .lock()
@@ -486,7 +495,7 @@ impl SettlementBackend for HttpCoordinator {
     }
     fn clock(&self) -> settle463_core::settlement::Result<i64> {
         let v = self
-            .public_json("GET", "/v1/sim/clock", None)
+            .public_json("GET", "/v1/clock", None)
             .map_err(funding)?;
         if v["environment"] != self.env {
             return Err(FundingError::Environment);

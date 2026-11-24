@@ -34,7 +34,7 @@ impl Actor {
             http: Some(http),
         })
     }
-    fn coordinator(&self) -> Result<&HttpCoordinator> {
+    pub(crate) fn coordinator(&self) -> Result<&HttpCoordinator> {
         self.http.as_deref().ok_or(Error::Unavailable)
     }
     fn authorize_action(
@@ -43,7 +43,23 @@ impl Actor {
         action: Action,
         m: Option<&SignedMessage>,
     ) -> Result<Submission> {
-        let expected = Review::sim_fund(a, self.env())?;
+        let expected = Review::from_agreement(a, self.env())?;
+        if self.env().starts_with("solana:") {
+            let http = self.coordinator()?;
+            let prior_delivery = match (action, m.map(|m| &m.unsigned().payload)) {
+                (Action::Release, Some(Body::Verdict(v))) => Some(v.delivery_id.clone()),
+                (Action::Refund, None) => http.order(&expected.order_id)?["delivery_id"]
+                    .as_str().map(str::to_owned),
+                _ => None,
+            }.map(|id| http.fetch_for_order(&id, &expected.order_id)).transpose()?;
+            let command = match (action, m) {
+                (Action::CommitDelivery, Some(msg)) => crate::LedgerAction::CommitDelivery(msg),
+                (Action::Release, Some(msg)) => crate::LedgerAction::Release(prior_delivery.as_ref().ok_or(Error::Linkage)?,msg),
+                (Action::Refund,None) => crate::LedgerAction::Refund(prior_delivery.as_ref()),
+                _ => return Err(Error::Linkage),
+            };
+            return http.ledger_action(a, command, None);
+        }
         let review = self.backend.prepare_action(&expected.order_id, action, m)?;
         if review.action != action || review.terms != expected {
             return Err(Error::Linkage);
@@ -119,7 +135,7 @@ impl SellerClient {
         a: &Agreement,
         artifact: &StoredArtifact,
     ) -> Result<SignedMessage> {
-        let terms = Review::sim_fund(a, self.actor.env())?;
+        let terms = Review::from_agreement(a, self.actor.env())?;
         if self.actor.identity.public_hex() != terms.seller {
             return Err(Error::PolicyRejected);
         }
@@ -191,7 +207,7 @@ impl VerifierClient {
     /// Reuses the coordinator's first definitive signed decision. An unavailable artifact can be retried.
     pub fn judge(&self, a: &Agreement, msg: &SignedMessage) -> Result<SignedMessage> {
         let _guard = self.judge_lock.lock().map_err(|_| Error::Unavailable)?;
-        let terms = Review::sim_fund(a, self.actor.env())?;
+        let terms = Review::from_agreement(a, self.actor.env())?;
         let (_, q) = a.terms(self.actor.env())?;
         let d = self.delivery(&terms, msg)?;
         let delivery_id = hex_string(msg.id());
@@ -266,7 +282,7 @@ impl VerifierClient {
         delivery: &SignedMessage,
         verdict: &SignedMessage,
     ) -> Result<Submission> {
-        let terms = Review::sim_fund(a, self.actor.env())?;
+        let terms = Review::from_agreement(a, self.actor.env())?;
         let (_, q) = a.terms(self.actor.env())?;
         let d = self.delivery(&terms, delivery)?;
         let v = self.check_verdict(&terms, &hex_string(delivery.id()), verdict)?;
