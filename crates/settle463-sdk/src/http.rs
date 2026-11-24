@@ -279,6 +279,14 @@ impl HttpCoordinator {
         }
         Ok(msg)
     }
+    pub(crate) fn original_order_message(
+        &self,
+        order: &str,
+        value: &Value,
+    ) -> Result<SignedMessage> {
+        let embedded = parse_signed(&serde_json::to_vec(value)?, &self.env)?;
+        self.fetch_for_order(&hex_string(embedded.id()), order)
+    }
     pub(crate) fn post_signed(&self, msg: &SignedMessage, direct: bool) -> Result<SignedMessage> {
         if msg.unsigned().environment != self.env {
             return Err(Error::Environment);
@@ -299,7 +307,7 @@ impl HttpCoordinator {
             .post(&format!("{}/v1/{route}", self.base))
             .set("Content-Type", "application/json")
             .set("Idempotency-Key", &hex_string(&crate::random_seed()?));
-        let bytes = match read_response(req.send_bytes(&msg.to_wire()?), MAX_JSON) {
+        let bytes = match read_response(req.send_bytes(msg.wire_bytes()), MAX_JSON) {
             Err(Error::Http { status: 409, code }) if code == "ACCEPTANCE_EXISTS" => {
                 return Err(Error::AcceptanceExists)
             }
@@ -415,7 +423,7 @@ impl MessageTransport for HttpCoordinator {
         if v["acceptance"].is_null() {
             return Ok(None);
         }
-        let a = parse_signed(&serde_json::to_vec(&v["acceptance"])?, &self.env)?;
+        let a = self.original_order_message(&r.order_id, &v["acceptance"])?;
         let Body::Accept(accepted) = &a.unsigned().payload else {
             return Err(Error::Linkage);
         };

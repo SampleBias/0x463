@@ -208,21 +208,23 @@ struct Peer {
     url: String,
 }
 impl Peer {
-    fn start(keys: &Value) -> Self {
+    fn start(buyer: &str, issuer_seed: &[u8; 32]) -> Self {
         use std::io::{BufRead, BufReader};
         let state = Session::new();
         fs::create_dir(&state.0).unwrap();
         let key_file = state.0.join("issuer.key");
-        fs::write(&key_file, keys["coordinator"]["seed_hex"].as_str().unwrap()).unwrap();
+        fs::write(&key_file, hex_string(issuer_seed)).unwrap();
+        let mut admin_token = [0; 32];
+        getrandom::getrandom(&mut admin_token).unwrap();
         let config = settle463d::Config {
             database: state.0.join("db.sqlite"),
             artifact_root: state.0.join("artifacts"),
             issuer_seed_file: key_file,
             environment: "sim:fixture".into(),
-            buyer: keys["buyer"]["public_key_hex"].as_str().unwrap().into(),
+            buyer: buyer.to_owned(),
             opening_balance: 5_000_000,
             clock: 1_700_000_000,
-            admin_token: "a5".repeat(32),
+            admin_token: hex_string(&admin_token),
         };
         let file = state.0.join("coordinator.json");
         fs::write(&file, serde_json::to_vec(&config).unwrap()).unwrap();
@@ -266,8 +268,12 @@ fn direct_peer_transfers_signed_quote_to_second_coordinator_without_discovery() 
     ))
     .unwrap();
     let keys = &vector["keys"];
-    let source = Peer::start(keys);
-    let destination = Peer::start(keys);
+    let buyer_public = keys["buyer"]["public_key_hex"].as_str().unwrap();
+    let source_seed = hex(keys["coordinator"]["seed_hex"].as_str().unwrap()).unwrap();
+    let mut destination_seed = [0; 32];
+    getrandom::getrandom(&mut destination_seed).unwrap();
+    let source = Peer::start(buyer_public, &source_seed);
+    let destination = Peer::start(buyer_public, &destination_seed);
     assert_ne!(source.url, destination.url);
     assert_ne!(source.state.0, destination.state.0);
     let connect = |url: &str, role, name: &str| {
@@ -287,14 +293,20 @@ fn direct_peer_transfers_signed_quote_to_second_coordinator_without_discovery() 
         "sim:fixture",
     )
     .unwrap();
-    let quote = parse_signed(
-        include_bytes!("../../../spec/examples/worked-transaction/quote.json"),
-        "sim:fixture",
-    )
-    .unwrap();
+    let pretty_quote = include_bytes!("../../../spec/examples/worked-transaction/quote.json");
+    let quote = parse_signed(pretty_quote, "sim:fixture").unwrap();
+    assert_ne!(pretty_quote.as_slice(), quote.to_wire().unwrap());
     let Body::Quote(q) = &quote.unsigned().payload else {
         panic!("expected fixture quote")
     };
+    assert_eq!(
+        q.receipt_issuer,
+        Identity::from_seed(&source_seed).public_hex()
+    );
+    assert_ne!(
+        q.receipt_issuer,
+        Identity::from_seed(&destination_seed).public_hex()
+    );
     let id = hex_string(quote.id());
     for m in [&offer, &request, &quote] {
         seller.publish(m.clone()).unwrap();
@@ -304,7 +316,9 @@ fn direct_peer_transfers_signed_quote_to_second_coordinator_without_discovery() 
     }
     assert!(buyer.fetch_for_order(&id, &q.order_id).is_err());
     let signed = seller.fetch_for_order(&id, &q.order_id).unwrap();
+    assert_eq!(signed.wire_bytes(), pretty_quote);
     direct.publish(signed).unwrap();
     let received = buyer.fetch(&id).unwrap();
-    assert_eq!(received.to_wire().unwrap(), quote.to_wire().unwrap());
+    assert_eq!(received.wire_bytes(), pretty_quote);
+    assert_eq!(received.id(), quote.id());
 }

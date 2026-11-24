@@ -274,9 +274,12 @@ pub fn check_verdict(
         || v.quote_id != terms.quote_id
         || v.policy_hash != terms.policy_hash
         || v.delivery_id != hex_string(delivery.id())
-        || (v.decision == "PASS"
-            && (v.observed_digest.as_ref() != Some(&d.digest)
-                || v.observed_length.as_ref() != Some(&d.length)))
+        || v.observed_digest
+            .as_ref()
+            .is_some_and(|hash| hash != &d.digest)
+        || v.observed_length
+            .as_ref()
+            .is_some_and(|size| size != &d.length)
     {
         return Err(FundingError::Linkage);
     }

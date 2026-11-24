@@ -307,6 +307,87 @@ async fn direct_quote_preserves_wire_bytes_and_private_read_consumes_challenge()
 }
 
 #[tokio::test]
+async fn relay_accepts_remote_issuer_quote_without_acquiring_settlement_authority() {
+    let (_dir, relay) = server().await;
+    let remote = SigningKey::from_bytes(&[42; 32]);
+    let quote = resign(QUOTE, &key("seller"), |body| {
+        let Body::Quote(q) = body else { panic!() };
+        q.receipt_issuer = public(&remote);
+    });
+    let acceptance = resign(ACCEPT, &key("buyer"), |body| {
+        let Body::Accept(a) = body else { panic!() };
+        a.quote_id = hex_string(quote.id());
+    });
+    let quote_bytes = quote.to_wire().unwrap();
+    for (name, bytes) in [
+        ("offer", OFFER),
+        ("request", REQUEST),
+        ("quote", &quote_bytes),
+    ] {
+        assert_eq!(
+            publish(&relay, "/v1/messages", bytes, name).await.ok(),
+            bytes
+        );
+    }
+    let path = format!("/v1/messages/{}", hex_string(quote.id()));
+    assert_eq!(
+        read(&relay, "buyer", &key("buyer"), &path).await.ok(),
+        quote_bytes
+    );
+    publish(
+        &relay,
+        "/v1/messages",
+        &acceptance.to_wire().unwrap(),
+        "accept",
+    )
+    .await
+    .ok();
+    let order_path = format!("/v1/orders/{ORDER}");
+    let order = read(&relay, "receipt_issuer", &remote, &order_path)
+        .await
+        .json();
+    let review: Review = serde_json::from_value(order["review"].clone()).unwrap();
+    assert_eq!(review.receipt_issuer, public(&remote));
+    command(
+        &relay,
+        "buyer",
+        "prepare",
+        &json!({"action":"fund"}),
+        "prepare",
+    )
+    .await
+    .error(403, "ROLE_FORBIDDEN");
+    let signing = review.signing_bytes().unwrap();
+    let cmd = json!({
+        "action":"fund",
+        "buyer_signature":hex_string(&key("buyer").sign(&signing).to_bytes()),
+        "seller_signature":hex_string(&key("seller").sign(&signing).to_bytes()),
+    });
+    command(&relay, "seller", "submit", &cmd, "submit")
+        .await
+        .error(403, "ROLE_FORBIDDEN");
+    let state = read(&relay, "buyer", &key("buyer"), &order_path)
+        .await
+        .json();
+    assert_eq!(state["state"], "Accepted");
+    assert_eq!(state["buyer_balance"], "5000000");
+    assert_eq!(state["held"], "0");
+    read(
+        &relay,
+        "buyer",
+        &key("buyer"),
+        &format!("{order_path}/receipt"),
+    )
+    .await
+    .error(404, "RECEIPT_NOT_READY");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM intents")
+        .fetch_one(&relay.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
 async fn artifact_upload_is_bounded_immutable_and_authorized_per_order() {
     let (_dir, s) = server().await;
     accepted(&s).await;

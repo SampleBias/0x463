@@ -7,7 +7,7 @@ use ed25519_dalek::Signer;
 use settle463_core::{
     artifact::MAX_BYTES,
     ident::{decimal, hex, hex_string, timestamp},
-    message_id, parse_signed,
+    message_id,
     settlement::{Action, Agreement, Review, Submission},
     sign,
     wire::{Body, Delivery, Verdict},
@@ -200,10 +200,10 @@ impl VerifierClient {
             return Err(Error::Linkage);
         }
         if !order["definitive_verdict"].is_null() {
-            let existing = parse_signed(
-                &serde_json::to_vec(&order["definitive_verdict"])?,
-                self.actor.env(),
-            )?;
+            let existing = self
+                .actor
+                .coordinator()?
+                .original_order_message(&terms.order_id, &order["definitive_verdict"])?;
             let v = self.check_verdict(&terms, &delivery_id, &existing)?;
             if !matches!(v.decision.as_str(), "PASS" | "FAIL") {
                 return Err(Error::Linkage);

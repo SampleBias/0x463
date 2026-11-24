@@ -241,6 +241,30 @@ fn actions_require_correct_evidence_and_separate_authority() {
 }
 
 #[test]
+fn failed_verdict_observations_must_describe_the_committed_delivery() {
+    let o = Order::funded();
+    let review = o.view().review;
+    for change_digest in [true, false] {
+        let mut unsigned = o.verdict.unsigned().clone();
+        let Body::Verdict(v) = &mut unsigned.payload else {
+            unreachable!()
+        };
+        v.decision = "FAIL".into();
+        v.reason_codes = vec!["SCHEMA_MISMATCH".into()];
+        if change_digest {
+            v.observed_digest = Some("ef".repeat(32));
+        } else {
+            v.observed_length = Some("51".into());
+        }
+        let signed = sign(unsigned, &key("verifier")).unwrap();
+        assert!(matches!(
+            settle463_core::settlement::check_verdict(&review, &o.delivery, &signed),
+            Err(FundingError::Linkage)
+        ));
+    }
+}
+
+#[test]
 fn pending_release_expires_at_execution_and_a_refund_can_finalize() {
     let o = Order::funded();
     o.deliver();

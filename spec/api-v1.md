@@ -87,6 +87,12 @@ Error body:
 | 422 | `POLICY_REJECTED`, `LINKAGE_FAILED`, `DEADLINE_ORDER`, `ENVIRONMENT_MISMATCH`, `AMOUNT_REJECTED`, `SCHEMA_REJECTED` |
 | 503 | `STORE_UNAVAILABLE`, `LEDGER_UNAVAILABLE` |
 
+## Simulator controls
+
+The loopback simulator accepts `POST /v1/sim/clock` with the deployment's `X-Sim-Admin` token, an `Idempotency-Key`, and a JSON body such as `{"clock":"1900000000"}`. The value is an absolute Unix timestamp. Advancing the clock persists the new ledger time. A request to move it backwards returns `409 STATE_CONFLICT`.
+
+Debug builds support `SETTLE463_TEST_STOP=before_broadcast` for crash recovery testing. The process exits with status 86 after committing an authorized action intent and its outbox row. Restarting with the same configuration and the hook unset recovers the pending action before the service announces its address.
+
 ## Artifact store
 
 The seller uploads after acceptance and before `deliver_by`. The request body is the raw bytes, with a maximum of 1048576 bytes enforced by the server limit before the body is stored. Headers:

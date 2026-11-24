@@ -122,7 +122,16 @@ fn check_fields(command: &Value, signed: bool) -> Result<()> {
     Ok(())
 }
 
+async fn require_local_settlement(s: &State, db: &mut Conn, order: &str) -> Result<()> {
+    let local = hex_string(s.key.verifying_key().as_bytes());
+    if !db::member(db, order, &local, "receipt_issuer").await? {
+        return Err(ApiError::denied("ROLE_FORBIDDEN"));
+    }
+    Ok(())
+}
+
 pub(crate) async fn prepare(s: &State, db: &mut Conn, order: &str, v: &Value) -> Result<Vec<u8>> {
+    require_local_settlement(s, db, order).await?;
     check_fields(v, false)?;
     let sim = restore(s, db).await?;
     if field(v, "action")? == "fund" {
@@ -135,6 +144,7 @@ pub(crate) async fn prepare(s: &State, db: &mut Conn, order: &str, v: &Value) ->
 }
 
 pub(crate) async fn enqueue(s: &State, db: &mut Conn, order: &str, v: &Value) -> Result<String> {
+    require_local_settlement(s, db, order).await?;
     check_fields(v, true)?;
     let action = field(v, "action")?;
     let input = canonical::canonical(v)?;
@@ -189,6 +199,7 @@ pub(crate) async fn enqueue(s: &State, db: &mut Conn, order: &str, v: &Value) ->
 }
 async fn receipt(s: &State, db: &mut Conn, view: &OrderView) -> Result<()> {
     let order = &view.review.order_id;
+    require_local_settlement(s, db, order).await?;
     let a = db::agreement(db, &s.config.environment, order).await?;
     let delivery = match &view.delivery_id {
         Some(id) => Some(db::load(db, id, &s.config.environment).await?),

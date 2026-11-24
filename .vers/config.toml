@@ -18,3 +18,29 @@ argv = ["cargo", "run", "--quiet", "--offline", "--locked", "-p", "settle463-sdk
 expected_exit = 0
 stdout = "Funded held=2000000 paid=0 refunded=0 buyer_balance=3000000 seller_balance=0\n"
 stderr = ""
+
+[[runtime]]
+name = "verify the independently signed reference bundle offline"
+argv = [
+  "cargo", "run", "--quiet", "--offline", "--locked", "-p", "settle463", "--",
+  "receipt", "verify", "spec/examples/worked-transaction/bundle.json", "--offline",
+  "--environment", "sim:fixture",
+  "--trusted-order", "8ed07cfeafd6b86b5c1a4501912ec6f1984442f1247bd79aca2a2f166433b51c",
+  "--trusted-issuer", "23fbe6e3f13af792e9ed982cfa5db5cba90019781f217ffd8642c13e3a10a91a",
+]
+expected_exit = 0
+stdout = "evidence_signed\n"
+stderr = ""
+
+[[runtime]]
+name = "reject an issuer outside the caller's trust input"
+argv = [
+  "cargo", "run", "--quiet", "--offline", "--locked", "-p", "settle463", "--",
+  "receipt", "verify", "spec/examples/worked-transaction/bundle.json", "--offline",
+  "--environment", "sim:fixture",
+  "--trusted-order", "8ed07cfeafd6b86b5c1a4501912ec6f1984442f1247bd79aca2a2f166433b51c",
+  "--trusted-issuer", "1111111111111111111111111111111111111111111111111111111111111111",
+]
+expected_exit = 3
+stdout = "untrusted\n"
+stderr = ""

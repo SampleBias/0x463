@@ -230,9 +230,6 @@ pub(crate) async fn publish(
         Body::Quote(q) => {
             let request = load(db, &q.request_id, env).await?;
             check_quote_request(msg, &request).map_err(|_| ApiError::link())?;
-            if q.receipt_issuer != hex_string(s.key.verifying_key().as_bytes()) {
-                return Err(ApiError::link());
-            }
             insert_message(db, msg, bytes).await?;
             audit(
                 s,

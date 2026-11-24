@@ -89,3 +89,23 @@ fn every_worked_id_and_the_quote_ceiling() {
     .unwrap();
     assert!(check_quote_request(&over, &request).is_err());
 }
+
+#[test]
+fn verified_input_preserves_wire_bytes_without_changing_signature_rules() {
+    let pretty = include_bytes!("../../../spec/examples/worked-transaction/service_offer.json");
+    let offer = parse_signed(pretty, "sim:fixture").unwrap();
+    let canonical = offer.to_wire().unwrap();
+    assert_ne!(pretty.as_slice(), canonical);
+    assert_eq!(offer.wire_bytes(), pretty);
+    let roundtrip = parse_signed(&canonical, "sim:fixture").unwrap();
+    assert_eq!(roundtrip.id(), offer.id());
+    assert_eq!(roundtrip.signature(), offer.signature());
+
+    let mut edited: Value = serde_json::from_slice(pretty).unwrap();
+    edited["body"]["expires_at"] = "1700007201".into();
+    let changed = serde_json::to_vec_pretty(&edited).unwrap();
+    assert!(matches!(
+        parse_signed(&changed, "sim:fixture"),
+        Err(settle463_core::Error::Signature)
+    ));
+}

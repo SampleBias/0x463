@@ -13,6 +13,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use wire::{Body, Policy};
 
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +43,7 @@ pub struct SignedMessage {
     unsigned: UnsignedMessage,
     signature: [u8; 64],
     id: [u8; 32],
+    wire: Arc<[u8]>,
 }
 
 impl SignedMessage {
@@ -55,11 +57,21 @@ impl SignedMessage {
         &self.id
     }
 
-    pub fn to_wire(&self) -> Result<Vec<u8>> {
-        let mut value = serde_json::to_value(&self.unsigned)?;
-        value["signature"] = ident::hex_string(&self.signature).into();
-        canonical::canonical(&value)
+    /// Original envelope bytes for forwarding and storage. Locally signed messages use JCS.
+    pub fn wire_bytes(&self) -> &[u8] {
+        &self.wire
     }
+
+    /// Canonical serialization of the signed envelope, independent of its transport encoding.
+    pub fn to_wire(&self) -> Result<Vec<u8>> {
+        canonical_envelope(&self.unsigned, &self.signature)
+    }
+}
+
+fn canonical_envelope(unsigned: &UnsignedMessage, signature: &[u8; 64]) -> Result<Vec<u8>> {
+    let mut value = serde_json::to_value(unsigned)?;
+    value["signature"] = ident::hex_string(signature).into();
+    canonical::canonical(&value)
 }
 
 fn domain_preimage(domain: &[u8], value: &Value) -> Result<Vec<u8>> {
@@ -101,8 +113,10 @@ pub fn sign(unsigned: UnsignedMessage, key: &SigningKey) -> Result<SignedMessage
         return Err(Error::Signature);
     }
     let preimage = signing_preimage(&unsigned)?;
+    let signature = key.sign(&preimage).to_bytes();
     Ok(SignedMessage {
-        signature: key.sign(&preimage).to_bytes(),
+        wire: canonical_envelope(&unsigned, &signature)?.into(),
+        signature,
         id: message_id(&preimage),
         unsigned,
     })
@@ -146,6 +160,7 @@ pub fn parse_signed(bytes: &[u8], expected_environment: &str) -> Result<SignedMe
     key.verify_strict(&preimage, &Signature::from_bytes(&signature))
         .map_err(|_| Error::Signature)?;
     Ok(SignedMessage {
+        wire: Arc::from(bytes),
         id: message_id(&preimage),
         unsigned,
         signature,

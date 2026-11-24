@@ -17,9 +17,13 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --locked -p settle463-core -p settle463-verify -p settle463-sim -p settle463-sdk -p settle463d -p settle463 --all-targets -- -D warnings
       - run: cargo test --locked -p settle463-core -p settle463-verify -p settle463-sim -p settle463-sdk -p settle463d -p settle463
+        env:
+          CARGO_NET_OFFLINE: "true"
       - run: python3 fixtures/tools/independent_vector.py
       - name: Exercise public CLI and independently verify each receipt
         run: python3 scripts/phase-c-scenarios.py "$RUNNER_TEMP/phase-c-evidence"
+        env:
+          CARGO_NET_OFFLINE: "true"
       - name: Retain public receipts and transcripts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
