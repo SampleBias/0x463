@@ -768,5 +768,160 @@ fn a_batched_refund_verifies_each_order_against_its_own_invocation() {
         ));
     }
     let duplicate = Message::new(&[refunds[0].clone(), refunds[0].clone()], Some(&payer));
-    assert!(first.external_refund(&duplicate).is_err());
+    let finalized = crate::evidence::FinalizedMessage::resolve(
+        solana_message::VersionedMessage::Legacy(duplicate),
+        &json!({}),
+    )
+    .unwrap();
+    assert!(first.external_terminal(&finalized).is_err());
+}
+
+#[test]
+fn sponsored_v0_refund_verifies_original_signatures_and_finalized_table_addresses() {
+    use solana_message::{v0, AddressLookupTableAccount, VersionedMessage};
+    let mut e = example(ChainAction::Refund);
+    e.payer = None;
+    let sponsor = actor(13);
+    let caller = actor(14);
+    let program = key(&e.deployment.program_id).unwrap();
+    let mint = key(&e.deployment.mint).unwrap();
+    let escrow = key(&e.terms.escrow_account).unwrap();
+    let buyer_ata = key(&e.terms.buyer_destination).unwrap();
+    let token = key(TOKEN_PROGRAM).unwrap();
+    let table = AddressLookupTableAccount {
+        key: Pubkey::new_from_array([87; 32]),
+        addresses: vec![mint, e.vault, token, escrow, buyer_ata],
+    };
+    for unauthorized in ["caller", "vault"] {
+        let mut ix = e.escrow_ix(address(&caller)).unwrap();
+        if unauthorized == "caller" {
+            ix.accounts[0].is_signer = false;
+        } else {
+            ix.accounts[3].is_writable = false;
+        }
+        let v0 =
+            v0::Message::try_compile(&address(&sponsor), &[ix], &[], Default::default()).unwrap();
+        let m = crate::evidence::FinalizedMessage::resolve(VersionedMessage::V0(v0), &json!({}))
+            .unwrap();
+        assert!(e.external_terminal(&m).is_err());
+    }
+    for use_table in [false, true] {
+        let tables = if use_table {
+            std::slice::from_ref(&table)
+        } else {
+            &[]
+        };
+        let ix = e.escrow_ix(address(&caller)).unwrap();
+        let v0 = v0::Message::try_compile(&address(&sponsor), &[ix], tables, Default::default())
+            .unwrap();
+        assert_eq!(v0.account_keys[0], address(&sponsor));
+        assert_eq!(v0.account_keys[1], address(&caller));
+        let mut writable = vec![];
+        let mut readonly = vec![];
+        for lookup in &v0.address_table_lookups {
+            writable.extend(
+                lookup
+                    .writable_indexes
+                    .iter()
+                    .map(|n| table.addresses[usize::from(*n)]),
+            );
+            readonly.extend(
+                lookup
+                    .readonly_indexes
+                    .iter()
+                    .map(|n| table.addresses[usize::from(*n)]),
+            );
+        }
+        let mut all = v0.account_keys.clone();
+        all.extend(&writable);
+        all.extend(&readonly);
+        let i = |k: Pubkey| all.iter().position(|a| *a == k).unwrap();
+        let raw = VersionedMessage::V0(v0).serialize();
+        let fee_signature = sponsor.sign(&raw).to_bytes();
+        let caller_signature = caller.sign(&raw).to_bytes();
+        let wire = [
+            vec![2],
+            fee_signature.to_vec(),
+            caller_signature.to_vec(),
+            raw,
+        ]
+        .concat();
+        let locator = bs58::encode(fee_signature).into_string();
+        let amount = |index: usize, value: &str| {
+            json!({"accountIndex": index, "mint":e.deployment.mint,
+            "uiTokenAmount": {"amount":value, "decimals":6}})
+        };
+        let transfers = [vec![12], 2_000_000u64.to_le_bytes().to_vec(), vec![6]].concat();
+        let response = json!({"version":0,"slot":90,"transaction":[STANDARD.encode(&wire),"base64"],"meta":{
+            "err":null,"loadedAddresses":{
+                "writable":writable.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "readonly":readonly.iter().map(ToString::to_string).collect::<Vec<_>>()},
+            "preTokenBalances":[amount(i(e.vault),"2000005"), amount(i(buyer_ata),"3000000")],
+            "postTokenBalances":[amount(i(e.vault),"5"), amount(i(buyer_ata),"5000000")],
+            "innerInstructions":[{"index":0,"instructions":[{"programIdIndex":i(token),"stackHeight":2,
+                "accounts":[i(e.vault),i(mint),i(buyer_ata),i(escrow)], "data":bs58::encode(transfers).into_string()}]}]
+        }});
+        let mut bytes = escrow_bytes(&e);
+        bytes[488] = 3;
+        let mock = Arc::new(Ledger {
+            dep: e.deployment.clone(),
+            state: Mutex::new(Responses {
+                transaction: response.clone(),
+                escrow: Some(bytes),
+                ..Responses::default()
+            }),
+        });
+        let rpc = Rpc::with_transport(e.deployment.clone(), mock.clone());
+        let verify = || rpc.reconcile(&e, &locator, None);
+        assert_eq!(verify().unwrap().outcome, ChainOutcome::FinalizedSuccess);
+        let local = SignedTx {
+            signature: locator.clone(),
+            wire: STANDARD.encode(&wire),
+            context_slot: 0,
+            last_valid_block_height: 0,
+        };
+        assert!(e.validate_signed(&local).is_err());
+
+        let mut changed = wire.clone();
+        changed[65] ^= 1;
+        let mut corrupt = response.clone();
+        corrupt["transaction"][0] = json!(STANDARD.encode(changed));
+        mock.state.lock().unwrap().transaction = corrupt;
+        assert!(matches!(verify(), Err(Error::Invalid(_))));
+        if use_table {
+            assert_eq!(writable.len(), 3);
+            assert_eq!(readonly.len(), 2);
+            let mut missing = response.clone();
+            missing["meta"]
+                .as_object_mut()
+                .unwrap()
+                .remove("loadedAddresses");
+            mock.state.lock().unwrap().transaction = missing;
+            assert!(matches!(verify(), Err(Error::Unavailable(_))));
+            for (class, replacement) in [
+                ("readonly", json!([mint.to_string()])),
+                (
+                    "writable",
+                    json!([
+                        e.vault.to_string(),
+                        buyer_ata.to_string(),
+                        program.to_string()
+                    ]),
+                ),
+                (
+                    "writable",
+                    json!([
+                        e.vault.to_string(),
+                        buyer_ata.to_string(),
+                        Pubkey::new_from_array([71; 32]).to_string()
+                    ]),
+                ),
+            ] {
+                let mut malformed = response.clone();
+                malformed["meta"]["loadedAddresses"][class] = replacement;
+                mock.state.lock().unwrap().transaction = malformed;
+                assert!(matches!(verify(), Err(Error::Invalid(_))));
+            }
+        }
+    }
 }

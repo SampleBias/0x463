@@ -82,11 +82,13 @@ class Order:
         mint = self.mint if mint is None else mint
         principal = self.principal if principal is None else principal
         args = self.nonce + self.ids + bytes(self.verifier.pubkey())
-        args += struct.pack("<QqqqI", principal, self.fund_by, self.deliver_by, self.resolve_by, len(env)) + env
+        args += struct.pack("<QqqqI", principal, self.fund_by,
+                            self.deliver_by, self.resolve_by, len(env)) + env
         return Instruction(program, segment("fund") + args, [
             meta(key, True, True), meta(self.seller.pubkey(), True), meta(config),
             meta(self.escrow, write=True), meta(mint), meta(ata(key, self.mint), write=True),
-            meta(ata(self.seller.pubkey(), self.mint)), meta(self.vault, write=True), meta(token), meta(SYSTEM), meta(ATA),
+            meta(ata(self.seller.pubkey(), self.mint)), meta(
+                self.vault, write=True), meta(token), meta(SYSTEM), meta(ATA),
         ])
 
     def deliver(self, program, delivery_id):
@@ -112,7 +114,8 @@ class Validator:
         self.program = Pubkey.from_string(deployment["program_id"])
         self.config = Pubkey.from_string(deployment["config"])
         self.genesis = self.rpc("getGenesisHash")
-        require(self.genesis == deployment["genesis"] and deployment["token_program"] == str(TOKEN), "deployment pins")
+        require(self.genesis == deployment["genesis"]
+                and deployment["token_program"] == str(TOKEN), "deployment pins")
         self.env = f"solana:{self.genesis}:{self.program}:{self.config}"
         self.admin = load_key(keydir / "fee-payer.json")
         self.authority = load_key(keydir / "mint-authority.json")
@@ -161,12 +164,14 @@ class Validator:
         signers = {key.pubkey(): key for key in (payer, *others)}
         # Separate instructions in the same slot must also have distinct transaction identities.
         return Transaction.new_signed_with_payer(
-            [set_compute_unit_price(next(self.priority)), *ixs], payer.pubkey(), list(signers.values()), Hash.from_string(blockhash),
+            [set_compute_unit_price(next(self.priority)), *
+             ixs], payer.pubkey(), list(signers.values()), Hash.from_string(blockhash),
         )
 
     def submit(self, tx, errors=()):
         wire = base64.b64encode(bytes(tx)).decode()
-        signature = self.rpc("sendTransaction", wire, {"encoding": "base64", "skipPreflight": True, "maxRetries": 5})
+        signature = self.rpc("sendTransaction", wire, {
+                             "encoding": "base64", "skipPreflight": True, "maxRetries": 5})
         require(signature == str(tx.signatures[0]), "RPC signature differs from signed transaction")
         end = time.monotonic() + 45
         while time.monotonic() < end:
@@ -200,7 +205,7 @@ class Validator:
         end = time.monotonic() + 15
         while time.monotonic() < end:
             tx = self.rpc("getTransaction", signature, {"encoding": "json", "commitment": "confirmed",
-                                                       "maxSupportedTransactionVersion": 0})
+                                                        "maxSupportedTransactionVersion": 0})
             if tx is not None:
                 return tx
             time.sleep(0.1)
@@ -221,7 +226,8 @@ class Validator:
     def order(self, parties, deadlines, principal=PRINCIPAL):
         buyer, seller, verifier = parties
         nonce = secrets.token_bytes(32)
-        escrow = Pubkey.find_program_address([b"settle463", b"escrow", b"v1", bytes(buyer.pubkey()), nonce], self.program)[0]
+        escrow = Pubkey.find_program_address(
+            [b"settle463", b"escrow", b"v1", bytes(buyer.pubkey()), nonce], self.program)[0]
         return Order(buyer, seller, verifier, nonce, escrow, ata(escrow, self.mint), self.mint,
                      *deadlines, secrets.token_bytes(5 * 32), principal)
 
@@ -247,7 +253,8 @@ class Validator:
         rent = self.rpc("getMinimumBalanceForRentExemption", 82)
         create = create_account(dict(from_pubkey=self.admin.pubkey(), to_pubkey=mint.pubkey(), lamports=rent,
                                      space=82, owner=TOKEN))
-        init = token_ix(bytes([20, 9]) + bytes(self.authority.pubkey()) + bytes([0]), meta(mint.pubkey(), write=True))
+        init = token_ix(bytes([20, 9]) + bytes(self.authority.pubkey()) +
+                        bytes([0]), meta(mint.pubkey(), write=True))
         self.send([create, init], self.admin, mint)
         return mint.pubkey()
 
@@ -263,7 +270,8 @@ def program_cases(v):
     order = v.order(parts, (now + 100, now + 120, now + 150))
     for changes, error in [({"token": SYSTEM}, 6009), ({"mint": wrong_mint}, 6004), ({"principal": 0}, 6008)]:
         v.send(v.funding(order, **changes), buyer, seller, errors=(error,))
-        require(v.account(order.escrow) is None and v.account(order.vault) is None, "failed fund created accounts")
+        require(v.account(order.escrow) is None and v.account(
+            order.vault) is None, "failed fund created accounts")
         require(v.amount(ata(buyer.pubkey(), mint)) == PRINCIPAL, "failed fund debited buyer")
     opening_sol = v.account(buyer.pubkey())["lamports"]
     fund_signature = v.send([order.fund(v.env, v.program, v.config)], buyer, seller)
@@ -275,14 +283,17 @@ def program_cases(v):
     require(funded_account["lamports"] == rent, "escrow rent exemption")
     require(opening_sol - v.account(buyer.pubkey())["lamports"] == rent + funded_vault["lamports"] + tx["meta"]["fee"],
             "unexpected fee or rent delta")
-    require(v.amount(order.vault) == PRINCIPAL and v.amount(ata(buyer.pubkey(), mint)) == 0, "fund token deltas")
+    require(v.amount(order.vault) == PRINCIPAL and v.amount(
+        ata(buyer.pubkey(), mint)) == 0, "fund token deltas")
     v.send(v.funding(order), buyer, seller, errors=(6001, 6006))
     require(v.amount(order.vault) == PRINCIPAL, "duplicate deposit")
     v.dust(dust_key, order)
     delivery, verdict = secrets.token_bytes(32), secrets.token_bytes(32)
     commit_sig = v.send([order.deliver(v.program, delivery)], v.admin, seller)
-    release = order.terminal(v.program, caller=verifier.pubkey(), release=True, delivery_id=delivery, verdict_id=verdict)
-    bad_signer = order.terminal(v.program, caller=seller.pubkey(), release=True, delivery_id=delivery, verdict_id=verdict)
+    release = order.terminal(v.program, caller=verifier.pubkey(), release=True,
+                             delivery_id=delivery, verdict_id=verdict)
+    bad_signer = order.terminal(v.program, caller=seller.pubkey(), release=True,
+                                delivery_id=delivery, verdict_id=verdict)
     v.send([bad_signer], v.admin, seller, errors=(6000,))
     beneficiary = ata(seller.pubkey(), mint)
     freeze = [meta(beneficiary, write=True), meta(mint), meta(v.authority.pubkey(), True)]
@@ -296,7 +307,8 @@ def program_cases(v):
     require(v.account(beneficiary) is None, "seller ATA still exists")
     refund = order.terminal(v.program, caller=v.admin.pubkey())
     with ThreadPoolExecutor(max_workers=2) as pool:
-        payout = pool.submit(v.send, [create_ata(v.admin.pubkey(), seller.pubkey(), mint), release], v.admin, verifier)
+        payout = pool.submit(
+            v.send, [create_ata(v.admin.pubkey(), seller.pubkey(), mint), release], v.admin, verifier)
         ineligible = pool.submit(v.send, [refund], None, errors=(6002, 6006))
         payout_sig = payout.result()
         ineligible.result()
@@ -311,8 +323,8 @@ def program_cases(v):
     require(v.amount(order.vault) == 1 and v.amount(beneficiary) == PRINCIPAL and v.data(order.escrow)[488] == 2,
             "payout dust or replay invariant")
     v.evidence["payout"] = dict(escrow=str(order.escrow), vault=str(order.vault), rent_lamports=rent,
-                                 fund=fund_signature, commit_delivery=commit_sig, release=payout_sig,
-                                 frozen_failure=frozen_sig, fund_slot=tx["slot"], principal=PRINCIPAL, vault_dust=1)
+                                fund=fund_signature, commit_delivery=commit_sig, release=payout_sig,
+                                frozen_failure=frozen_sig, fund_slot=tx["slot"], principal=PRINCIPAL, vault_dust=1)
     parts = v.parties(PRINCIPAL)
     buyer, seller, _ = parts
     now = v.now()
@@ -328,7 +340,8 @@ def program_cases(v):
     require(v.amount(order.vault) == 1 and v.amount(ata(buyer.pubkey(), mint)) == PRINCIPAL
             and v.amount(ata(seller.pubkey(), mint)) == 0 and v.data(order.escrow)[488] == 3,
             "refund dust or replay invariant")
-    v.evidence["refund"] = dict(escrow=str(order.escrow), vault=str(order.vault), refund=ref_sig, principal=PRINCIPAL, vault_dust=1)
+    v.evidence["refund"] = dict(escrow=str(order.escrow), vault=str(order.vault),
+                                refund=ref_sig, principal=PRINCIPAL, vault_dust=1)
     print("T-SOL-01..07,09 and terminal replays passed", flush=True)
 
 
@@ -383,7 +396,8 @@ def boundary_attempt(v, attempt):
     for offset, records in cases.items():
         unfunded, funded, delivered, silent, delivery, verdict = records
         early = offset < 0
-        release = delivered.terminal(v.program, caller=verifier.pubkey(), release=True, delivery_id=delivery, verdict_id=verdict)
+        release = delivered.terminal(v.program, caller=verifier.pubkey(),
+                                     release=True, delivery_id=delivery, verdict_id=verdict)
         ref = delivered.terminal(v.program, caller=v.admin.pubkey())
         signed_cases[offset] = [
             (v.signed(v.funding(unfunded), buyer, seller), None if early else 6002),
@@ -417,7 +431,8 @@ def boundary_attempt(v, attempt):
         refund_sig, late_release_sig = refunded.result(), denied.result()
 
     _, _, order, _, _, _ = cases[0]
-    require(v.data(order.escrow)[488] == 3 and v.amount(order.vault) == 0, "deadline race did not refund once")
+    require(v.data(order.escrow)[488] == 3 and v.amount(
+        order.vault) == 0, "deadline race did not refund once")
     v.evidence["deadline_boundaries"] = dict(clock_mechanism="natural Clock sysvar seconds, processed-bank simulation",
                                              target=target, offsets=[-1, 0, 1], cases_per_offset=6,
                                              simulation_slots=sampled_slots,

@@ -1,8 +1,72 @@
 use super::*;
-use crate::transaction::{decode_wire, decoded_ix};
+use crate::transaction::{decode_wire, verified_wire};
 use serde_json::{json, Value};
 use settle463_core::settlement::{OrderState, OrderView};
-use solana_message::Message;
+use solana_message::VersionedMessage;
+use std::collections::HashSet;
+
+pub(crate) struct FinalizedMessage {
+    message: VersionedMessage,
+    account_keys: Vec<Pubkey>,
+}
+impl FinalizedMessage {
+    pub(crate) fn resolve(message: VersionedMessage, meta: &Value) -> Result<Self> {
+        let lookups = message.address_table_lookups().unwrap_or_default();
+        let mut source_indexes = HashSet::new();
+        for table in lookups {
+            for index in table.writable_indexes.iter().chain(&table.readonly_indexes) {
+                ensure(
+                    source_indexes.insert((table.account_key, *index)),
+                    "duplicate address table index",
+                )?;
+            }
+        }
+        let mut keys = message.static_account_keys().to_vec();
+        let loaded = &meta["loadedAddresses"];
+        if !loaded.is_null() || !lookups.is_empty() {
+            for (name, count) in [
+                (
+                    "writable",
+                    lookups
+                        .iter()
+                        .map(|t| t.writable_indexes.len())
+                        .sum::<usize>(),
+                ),
+                (
+                    "readonly",
+                    lookups
+                        .iter()
+                        .map(|t| t.readonly_indexes.len())
+                        .sum::<usize>(),
+                ),
+            ] {
+                let addresses = loaded.get(name).ok_or_else(|| {
+                    Error::Unavailable(format!("missing finalized loaded {name} addresses"))
+                })?;
+                let rows = addresses
+                    .as_array()
+                    .ok_or_else(|| invalid("invalid loaded address list"))?;
+                ensure(
+                    rows.len() == count,
+                    "loaded address count disagrees with signed lookup table indexes",
+                )?;
+                for row in rows {
+                    keys.push(key(row
+                        .as_str()
+                        .ok_or_else(|| invalid("invalid loaded address"))?)?);
+                }
+            }
+        }
+        ensure(
+            keys.iter().collect::<HashSet<_>>().len() == keys.len(),
+            "duplicate resolved accounts",
+        )?;
+        Ok(Self {
+            message,
+            account_keys: keys,
+        })
+    }
+}
 
 impl Expected {
     fn decode_escrow(&self, bytes: &[u8]) -> Result<OrderView> {
@@ -126,38 +190,52 @@ impl Expected {
     }
     // A permissionless refund may accompany unrelated instructions. Tie the transfer to the
     // escrow invocation itself and verify the complete net beneficiary and vault changes.
-    pub(crate) fn external_refund(&self, msg: &Message) -> Result<usize> {
-        let required = self.escrow_ix(msg.account_keys[0])?;
+    pub(crate) fn external_terminal(&self, msg: &FinalizedMessage) -> Result<usize> {
+        let program = key(&self.deployment.program_id)?;
         let escrow = key(&self.terms.escrow_account)?;
+        ensure(
+            self.payer
+                .is_none_or(|expected| msg.account_keys[0] == expected),
+            "different fee payer",
+        )?;
         let mut index = None;
-        for (i, c) in msg.instructions.iter().enumerate() {
-            let actual = decoded_ix(msg, c)?;
-            if actual.program_id == required.program_id
-                && actual.accounts.iter().any(|a| a.pubkey == escrow)
+        for (i, ix) in msg.message.instructions().iter().enumerate() {
+            if msg.account_keys[usize::from(ix.program_id_index)] != program
+                || !ix
+                    .accounts
+                    .iter()
+                    .any(|&a| msg.account_keys[usize::from(a)] == escrow)
             {
-                ensure(
-                    index.is_none()
-                        && actual.data == required.data
-                        && actual.accounts.len() == required.accounts.len()
-                        && actual
-                            .accounts
-                            .iter()
-                            .zip(&required.accounts)
-                            .all(|(a, b)| {
-                                a.pubkey == b.pubkey
-                                    && (!b.is_writable || a.is_writable)
-                                    && (!b.is_signer || a.is_signer)
-                            }),
-                    "external refund instruction",
-                )?;
-                index = Some(i);
+                continue;
             }
+            let caller = ix
+                .accounts
+                .first()
+                .ok_or_else(|| invalid("missing terminal caller"))?;
+            let required = self.escrow_ix(msg.account_keys[usize::from(*caller)])?;
+            ensure(
+                index.is_none()
+                    && ix.data == required.data
+                    && ix.accounts.len() == required.accounts.len()
+                    && ix
+                        .accounts
+                        .iter()
+                        .zip(&required.accounts)
+                        .all(|(&n, expected)| {
+                            let n = usize::from(n);
+                            msg.account_keys[n] == expected.pubkey
+                                && (!expected.is_writable || msg.message.is_maybe_writable(n, None))
+                                && (!expected.is_signer || msg.message.is_signer(n))
+                        }),
+                "external terminal instruction",
+            )?;
+            index = Some(i);
         }
-        index.ok_or_else(|| invalid("no escrow refund instruction"))
+        index.ok_or_else(|| invalid("no matching terminal instruction"))
     }
 }
 
-fn key_index(msg: &Message, address: Pubkey) -> Result<usize> {
+fn key_index(msg: &FinalizedMessage, address: Pubkey) -> Result<usize> {
     msg.account_keys
         .iter()
         .position(|k| *k == address)
@@ -228,7 +306,7 @@ fn account_indices(ix: &Value) -> Result<Vec<usize>> {
         })
         .collect()
 }
-fn program_is(ix: &Value, msg: &Message, program: Pubkey) -> bool {
+fn program_is(ix: &Value, msg: &FinalizedMessage, program: Pubkey) -> bool {
     ix["programIdIndex"]
         .as_u64()
         .and_then(|i| usize::try_from(i).ok())
@@ -236,7 +314,7 @@ fn program_is(ix: &Value, msg: &Message, program: Pubkey) -> bool {
         == Some(&program)
 }
 fn ata_initialized(
-    msg: &Message,
+    msg: &FinalizedMessage,
     meta: &Value,
     account: usize,
     mint: usize,
@@ -245,7 +323,7 @@ fn ata_initialized(
 ) -> Result<bool> {
     let token = key(TOKEN_PROGRAM)?;
     let ata = key(ATA_PROGRAM)?;
-    for (i, c) in msg.instructions.iter().enumerate() {
+    for (i, c) in msg.message.instructions().iter().enumerate() {
         let top = msg.account_keys.get(usize::from(c.program_id_index)) == Some(&ata)
             && matches!(c.data.as_slice(), [1] | [] | [0])
             && c.accounts
@@ -295,7 +373,7 @@ fn ata_initialized(
     }
     Ok(false)
 }
-fn transfer_evidence(e: &Expected, msg: &Message, meta: &Value, at: usize) -> Result<()> {
+fn transfer_evidence(e: &Expected, msg: &FinalizedMessage, meta: &Value, at: usize) -> Result<()> {
     if e.action == ChainAction::CommitDelivery {
         for ix in inner(meta, at)? {
             ensure(
@@ -432,17 +510,30 @@ impl Rpc {
         let wire = v["transaction"][0]
             .as_str()
             .ok_or_else(|| invalid("finalized transaction bytes"))?;
-        let (msg, bytes) = decode_wire(wire)?;
+        let (original, bytes) = verified_wire(wire)?;
+        if let Some(version) = v.get("version") {
+            ensure(
+                match original {
+                    VersionedMessage::Legacy(_) => version == "legacy",
+                    VersionedMessage::V0(_) => version == 0,
+                },
+                "RPC version disagrees with signed message",
+            )?;
+        }
+        let msg = FinalizedMessage::resolve(original, &v["meta"])?;
         ensure(
             bytes[1..65] == base58::<64>(signature).map_err(invalid)?
                 && stored.is_none_or(|tx| tx.wire == wire),
             "finalized bytes or signature differ from intent",
         )?;
-        let at = if stored.is_none() && e.action == ChainAction::Refund {
-            e.external_refund(&msg)?
-        } else {
-            e.review_message(&msg)?
-        };
+        let at =
+            if stored.is_none() && matches!(e.action, ChainAction::Refund | ChainAction::Release) {
+                e.external_terminal(&msg)?
+            } else if let VersionedMessage::Legacy(m) = &msg.message {
+                e.review_message(m)?
+            } else {
+                return Err(invalid("expected a reviewed legacy transaction"));
+            };
         let Some(err) = v["meta"].get("err") else {
             return Ok(Resolution::status(ChainOutcome::Unknown));
         };

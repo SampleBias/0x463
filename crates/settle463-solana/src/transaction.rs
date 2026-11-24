@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use bincode::Options;
 use ed25519_dalek::{Signature, VerifyingKey};
 use solana_instruction::{AccountMeta as Meta, Instruction};
-use solana_message::Message;
+use solana_message::{Message, VersionedMessage};
 
 const MAX_WIRE: usize = 1232;
 const MAX_COMPUTE_UNITS: u32 = 1_400_000;
@@ -88,13 +88,21 @@ pub(crate) fn decode_message(raw: &[u8]) -> Result<Message> {
     Ok(msg)
 }
 pub(crate) fn decode_wire(wire: &str) -> Result<(Message, Vec<u8>)> {
+    match verified_wire(wire)? {
+        (VersionedMessage::Legacy(message), bytes) => Ok((message, bytes)),
+        _ => Err(invalid(
+            "local intent must be a reviewed legacy transaction",
+        )),
+    }
+}
+pub(crate) fn verified_wire(wire: &str) -> Result<(VersionedMessage, Vec<u8>)> {
     ensure(
         wire.len() <= MAX_WIRE.div_ceil(3) * 4,
         "transaction too large",
     )?;
     let bytes = STANDARD.decode(wire).map_err(invalid)?;
     let count = usize::from(*bytes.first().ok_or_else(|| invalid("empty transaction"))?);
-    // A legacy transaction fits at most 12 signatures inside the packet limit.
+    // Each signer needs both a signature and its static public key inside the packet.
     ensure(
         (1..=12).contains(&count) && bytes.len() <= MAX_WIRE,
         "transaction signature count",
@@ -102,13 +110,28 @@ pub(crate) fn decode_wire(wire: &str) -> Result<(Message, Vec<u8>)> {
     let raw = bytes
         .get(1 + count * 64..)
         .ok_or_else(|| invalid("truncated signatures"))?;
-    let msg = decode_message(raw)?;
+    let msg: VersionedMessage = bincode::options()
+        .with_fixint_encoding()
+        .with_limit(MAX_WIRE as u64)
+        .reject_trailing_bytes()
+        .deserialize(raw)
+        .map_err(invalid)?;
+    msg.sanitize().map_err(invalid)?;
+    ensure(msg.serialize() == raw, "noncanonical transaction encoding")?;
+    let static_keys = msg.static_account_keys();
     ensure(
-        usize::from(msg.header.num_required_signatures) == count,
+        static_keys
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            == static_keys.len(),
+        "duplicate transaction accounts",
+    )?;
+    ensure(
+        usize::from(msg.header().num_required_signatures) == count,
         "signature count disagrees with message",
     )?;
-    for (k, s) in msg
-        .account_keys
+    for (k, s) in static_keys
         .iter()
         .zip(bytes[1..1 + count * 64].chunks_exact(64))
     {

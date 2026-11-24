@@ -65,7 +65,7 @@ def associated(owner, mint):
 def submit(url, instructions, payer, signers=()):
     latest = rpc(url, "getLatestBlockhash", [{"commitment": "confirmed"}])["value"]
     tx = Transaction.new_signed_with_payer(instructions, payer.pubkey(), [payer, *signers],
-                                         Hash.from_string(latest["blockhash"]))
+                                           Hash.from_string(latest["blockhash"]))
     sig = rpc(url, "sendTransaction", [base64.b64encode(bytes(tx)).decode(),
                                        {"encoding": "base64", "preflightCommitment": "confirmed"}])
     if sig != str(tx.signatures[0]):
@@ -83,7 +83,7 @@ def submit(url, instructions, payer, signers=()):
 def prepare(directory, url, program):
     payer = key(directory, "fee-payer")
     buyer, seller, verifier, issuer, authority = [key(directory, name).pubkey() for name in
-                                                ("buyer", "seller", "verifier", "coordinator", "mint-authority")]
+                                                  ("buyer", "seller", "verifier", "coordinator", "mint-authority")]
     mint = key(directory, "mint").pubkey()
     genesis = rpc(url, "getGenesisHash")
     config = Pubkey.find_program_address([b"settle463", b"config", b"v1"], program)[0]
@@ -92,22 +92,23 @@ def prepare(directory, url, program):
                  for p in [buyer, seller, verifier, issuer, authority]], payer)
     cfg = directory / "cli.yml"
     subprocess.run(["solana", "--config", str(cfg), "config", "set", "--url", url, "--keypair",
-                    str(directory/"fee-payer.json"), "--commitment", "finalized"], check=True)
+                    str(directory / "fee-payer.json"), "--commitment", "finalized"], check=True)
     spl = ["spl-token", "--config", str(cfg), "--url", url, "--program-id", str(TOKEN),
-           "--fee-payer", str(directory/"fee-payer.json")]
+           "--fee-payer", str(directory / "fee-payer.json")]
     subprocess.run(["spl-token", "--version"], check=True)
     subprocess.run(spl + ["create-token", "--decimals", "6", "--enable-freeze", "--mint-authority",
-                          str(authority), str(directory/"mint.json")], check=True)
+                          str(authority), str(directory / "mint.json")], check=True)
     for owner in [buyer, seller]:
         subprocess.run(spl + ["create-account", str(mint), "--owner", str(owner)], check=True)
     buyer_ata = associated(buyer, mint)
     subprocess.run(spl + ["mint", str(mint), "5", str(buyer_ata), "--mint-authority",
-                          str(directory/"mint-authority.json")], check=True)
-    m = rpc(url, "getAccountInfo", [str(mint), {"encoding": "jsonParsed", "commitment": "finalized"}])["value"]
+                          str(directory / "mint-authority.json")], check=True)
+    m = rpc(url, "getAccountInfo", [str(mint), {
+            "encoding": "jsonParsed", "commitment": "finalized"}])["value"]
     if m["owner"] != str(TOKEN) or m["data"]["parsed"]["info"]["decimals"] != 6 or \
             m["data"]["parsed"]["info"]["freezeAuthority"] != str(authority):
         raise RuntimeError("wrong mint owner, decimals or freeze authority")
-    if rpc(url, "getTokenAccountBalance", [str(buyer_ata), {"commitment":"finalized"}])["value"]["amount"] != "5000000":
+    if rpc(url, "getTokenAccountBalance", [str(buyer_ata), {"commitment": "finalized"}])["value"]["amount"] != "5000000":
         raise RuntimeError("wrong buyer opening balance")
     init = Instruction(program, hashlib.sha256(b"global:initialize_config").digest()[:8] + bytes(Hash.from_string(genesis)),
                        [AccountMeta(payer.pubkey(), True, True), AccountMeta(config, False, True),
@@ -116,7 +117,7 @@ def prepare(directory, url, program):
     signature, slot = submit(url, [init], payer)
     obj = dict(rpc_url=url, genesis=genesis, program_id=str(program), config=str(config),
                mint=str(mint), token_program=str(TOKEN))
-    (directory/"deployment.json").write_text(json.dumps(obj, indent=2)+"\n")
+    (directory / "deployment.json").write_text(json.dumps(obj, indent=2) + "\n")
     print(f"initialize_config={signature} slot={slot} deployment={json.dumps(obj)}", flush=True)
 
 
